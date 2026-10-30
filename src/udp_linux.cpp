@@ -50,6 +50,12 @@ VoidResult apply_udp_options(int fd, Family family, const UdpOptions& options) {
     }
   }
 
+  // 默认 UDP 收发缓冲 256KB：真实网卡 + 高 PPS 场景显著降低丢包
+  // loopback 场景几乎无影响；失败仅 warn，不阻塞 socket 创建
+  constexpr int kDefaultUdpBuf = 256 * 1024;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &kDefaultUdpBuf, sizeof(kDefaultUdpBuf));
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kDefaultUdpBuf, sizeof(kDefaultUdpBuf));
+
   return {};
 }
 
