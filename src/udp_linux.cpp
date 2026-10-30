@@ -1,5 +1,7 @@
+#define _GNU_SOURCE  // 暴露 recvmmsg/sendmmsg
 #include "uvnet/udp.hpp"
 
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <deque>
@@ -558,6 +560,9 @@ class UdpSocketImpl final : public IoWatcher,
     }
   }
 
+  // 一次 recvmmsg 最多收多少个 datagram — syscall 数降 1/kRecvBatch
+  static constexpr unsigned int kRecvBatch = 32;
+
   void do_recv() {
     if (!receiving_ || fd_ < 0) {
       return;
@@ -566,48 +571,61 @@ class UdpSocketImpl final : public IoWatcher,
     if (keepalive_reads_ && !recv_pool_) {
       recv_pool_ = BufferPool::create(recv_chunk_size_, 32);
     }
-    if (!keepalive_reads_ && span_recv_buffer_.empty()) {
-      span_recv_buffer_.resize(recv_chunk_size_);
+    // view 模式也用 BufferPool，让 recvmmsg 批量可以同时处理多个独立缓冲
+    if (!keepalive_reads_ && !recv_pool_) {
+      recv_pool_ = BufferPool::create(recv_chunk_size_, 32);
     }
 
     auto self = shared_from_this();
     while (receiving_ && fd_ >= 0) {
-      sockaddr_storage storage{};
-      socklen_t length = sizeof(storage);
-      BufferPool::Handle block;
-      std::byte* data = nullptr;
-      std::size_t capacity = 0;
-      if (keepalive_reads_) {
-        block = recv_pool_->acquire();
-        data = block.data.data();
-        capacity = block.data.size();
-      } else {
-        data = span_recv_buffer_.data();
-        capacity = span_recv_buffer_.size();
+      // 预填 batch：每个 entry 独立 BufferPool 缓冲 + 独立 source sockaddr
+      std::array<BufferPool::Handle, kRecvBatch> handles{};
+      std::array<sockaddr_storage, kRecvBatch> sources{};
+      std::array<iovec, kRecvBatch> iovecs{};
+      std::array<mmsghdr, kRecvBatch> mmsghdrs{};
+
+      for (unsigned int i = 0; i < kRecvBatch; ++i) {
+        handles[i] = recv_pool_->acquire();
+        iovecs[i].iov_base = handles[i].data.data();
+        iovecs[i].iov_len = handles[i].data.size();
+
+        mmsghdrs[i].msg_hdr.msg_name = &sources[i];
+        mmsghdrs[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+        mmsghdrs[i].msg_hdr.msg_iov = &iovecs[i];
+        mmsghdrs[i].msg_hdr.msg_iovlen = 1;
+        mmsghdrs[i].msg_hdr.msg_control = nullptr;
+        mmsghdrs[i].msg_hdr.msg_controllen = 0;
+        mmsghdrs[i].msg_hdr.msg_flags = 0;
+        mmsghdrs[i].msg_len = 0;
       }
 
-      const ssize_t count = ::recvfrom(fd_,
-                                       data,
-                                       capacity,
-                                       0,
-                                       reinterpret_cast<sockaddr*>(&storage),
-                                       &length);
+      const int received = ::recvmmsg(fd_, mmsghdrs.data(), kRecvBatch, 0, nullptr);
 
-      if (count >= 0) {
-        const SocketAddress source =
-            AddressCodec::from_native(reinterpret_cast<sockaddr*>(&storage),
-                                      static_cast<int>(length));
-        const std::span<const std::byte> bytes(data, static_cast<std::size_t>(count));
-        if (keepalive_reads_) {
-          auto callback = recv_callback_;
-          if (callback) {
-            callback(Datagram{bytes, source, block.keepalive});
+      if (received > 0) {
+        for (int i = 0; i < received; ++i) {
+          const auto addr = reinterpret_cast<const sockaddr*>(mmsghdrs[i].msg_hdr.msg_name);
+          const socklen_t addr_len = mmsghdrs[i].msg_hdr.msg_namelen;
+          const SocketAddress source = AddressCodec::from_native(addr, static_cast<int>(addr_len));
+          const std::span<const std::byte> bytes(
+              reinterpret_cast<const std::byte*>(handles[i].data.data()),
+              static_cast<std::size_t>(mmsghdrs[i].msg_len));
+
+          if (keepalive_reads_) {
+            auto callback = recv_callback_;
+            if (callback) {
+              callback(Datagram{bytes, source, std::move(handles[i].keepalive)});
+            }
+          } else {
+            auto callback = view_callback_;
+            if (callback) {
+              callback(DatagramView{bytes, source});
+            }
           }
-        } else {
-          auto callback = view_callback_;
-          if (callback) {
-            callback(DatagramView{bytes, source});
-          }
+          // view 模式下 keepalive 没被用户持有，自动回收
+        }
+        // 没用到的 buffer 回收
+        for (unsigned int i = static_cast<unsigned int>(received); i < kRecvBatch; ++i) {
+          handles[i].keepalive.reset();
         }
         continue;
       }
@@ -617,7 +635,7 @@ class UdpSocketImpl final : public IoWatcher,
         continue;
       }
       if (error == EAGAIN || error == EWOULDBLOCK) {
-        return;
+        break;  // 空 batch 直接退出，epoll 下次触发再来
       }
 
       receiving_ = false;
