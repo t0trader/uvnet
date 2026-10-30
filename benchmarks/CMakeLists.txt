@@ -1,0 +1,13 @@
+add_executable(uvnet_bench_tcp bench_tcp.cpp)
+add_executable(uvnet_bench_udp bench_udp.cpp)
+add_executable(uvnet_bench_dns bench_dns.cpp)
+
+foreach(bench_name IN ITEMS uvnet_bench_tcp uvnet_bench_udp uvnet_bench_dns)
+  target_link_libraries(${bench_name} PRIVATE uvnet)
+  target_include_directories(${bench_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  if(MSVC)
+    target_compile_options(${bench_name} PRIVATE /W4 /permissive- /utf-8 /EHsc)
+  else()
+    target_compile_options(${bench_name} PRIVATE -Wall -Wextra)
+  endif()
+endforeach()
