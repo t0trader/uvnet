@@ -98,6 +98,13 @@ Error from_socket_error(int code) noexcept {
     case ERROR_OPERATION_ABORTED: return Error{ErrorCode::Canceled, code};
     case ERROR_NOT_FOUND: return Error{ErrorCode::Canceled, code};
     case ERROR_NO_DATA: return Error{ErrorCode::NotConnected, code};
+    // IOCP 完成包走 GetOverlappedResult，拿到的是 Win32 ERROR_* 而不是 WSAE_*。
+    // 其中 UDP 收到的 ICMP 端口不可达就是以 ERROR_PORT_UNREACHABLE 形式上来的。
+    case ERROR_PORT_UNREACHABLE: return Error{ErrorCode::ConnectionRefused, code};
+    case ERROR_HOST_UNREACHABLE: return Error{ErrorCode::HostUnreachable, code};
+    case ERROR_NETWORK_UNREACHABLE: return Error{ErrorCode::NetworkUnreachable, code};
+    case ERROR_GRACEFUL_DISCONNECT: return Error{ErrorCode::ConnectionAborted, code};
+    case ERROR_INVALID_HANDLE: return Error{ErrorCode::BadFileDescriptor, code};
     case ERROR_NETNAME_DELETED: return Error{ErrorCode::ConnectionReset, code};
     case ERROR_CONNECTION_ABORTED: return Error{ErrorCode::ConnectionAborted, code};
     case ERROR_CONNECTION_REFUSED: return Error{ErrorCode::ConnectionRefused, code};
