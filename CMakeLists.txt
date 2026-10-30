@@ -4,6 +4,7 @@ project(uvnet VERSION 0.1.0 LANGUAGES CXX)
 
 option(UVNET_BUILD_TESTS "构建 uvnet 测试" ON)
 option(UVNET_BUILD_BENCHMARKS "构建 uvnet 性能基准" OFF)
+option(UVNET_BUILD_SAMPLES "构建 uvnet 示例" OFF)
 
 add_library(uvnet STATIC
   src/address.cpp
@@ -73,4 +74,8 @@ endif()
 
 if(UVNET_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
+endif()
+
+if(UVNET_BUILD_SAMPLES)
+  add_subdirectory(samples)
 endif()

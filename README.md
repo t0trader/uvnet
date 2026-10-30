@@ -40,6 +40,7 @@ uvnet/
   include/uvnet/       # 公共头文件
   src/                 # 公共实现 + *_linux.cpp / *_win.cpp 后端
   tests/               # ctest 用例
+  samples/             # 可运行的跨平台客户端 / 回显服务器示例
 ```
 
 ## 构建
@@ -74,7 +75,45 @@ cmake --build build-uvnet -j
 ./build-uvnet/benchmarks/uvnet_bench_dns
 ```
 
-## 示例
+可运行示例（默认不构建）：
+
+```bash
+cmake -S uvnet -B build-uvnet -DCMAKE_BUILD_TYPE=Release -DUVNET_BUILD_SAMPLES=ON
+cmake --build build-uvnet -j
+```
+
+## 完整客户端示例
+
+[samples/demo_client.cpp](samples/demo_client.cpp) 是一份可以直接拿来改的客户端骨架，
+同一份源码在 Windows（IOCP）和 Linux（epoll）上都跑，业务代码里没有任何网络相关的
+`#ifdef`。它覆盖了异步 DNS、连接超时、多地址回退、读窗口配置、零拷贝写、低开销视图读、
+优雅关闭和跨平台 Ctrl+C。
+
+```bash
+# 终端 1：起一个回显服务器（--udp 则用 UDP）
+./uvnet_demo_client --server --port 9000
+
+# 终端 2：客户端 ping-pong 5 次
+./uvnet_demo_client --count 5 127.0.0.1 9000
+./uvnet_demo_client --udp --count 5 127.0.0.1 9000
+
+# 用域名，自动按序回退（localhost 的 ::1 失败后会试 127.0.0.1）
+./uvnet_demo_client localhost 9000
+
+# 退出码：0 成功，1 失败（连接失败 / 中断），2 参数错误
+```
+
+程序里区分平台的只有三处，都在 `platform` 命名空间里：控制台 UTF-8 编码
+（`SetConsoleOutputCP`）、Ctrl+C 接管（`SetConsoleCtrlHandler` vs `sigaction`），
+其余全部由 uvnet 屏蔽。贡献一个客户端时的关键点：
+
+- 所有句柄操作都在循环线程里做，跨线程只允许 `Loop::post` / `Async::send`
+- 信号处理函数里只置原子标志，收尾动作交给循环线程上的定时器
+- 连接同一名字的多个地址要逐个尝试，失败的那个地址必须用新句柄重连
+- 需要转发数据时用 `start_read(ReadCallback)` 并把 `keepalive` 交给零拷贝写；
+  只解析数据时用视图读，省掉一次引用计数
+
+## API 片段
 
 ```cpp
 #include <uvnet/uvnet.hpp>

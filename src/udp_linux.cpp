@@ -1,4 +1,6 @@
-#define _GNU_SOURCE  // 暴露 recvmmsg/sendmmsg
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // 暴露 recvmmsg/sendmmsg（CMake 已经定义时跳过，避免重复定义告警）
+#endif
 #include "uvnet/udp.hpp"
 
 #include <array>
