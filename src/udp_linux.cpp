@@ -647,43 +647,75 @@ class UdpSocketImpl final : public IoWatcher,
 
   void flush_sends() {
     auto self = shared_from_this();
+    static constexpr unsigned int kSendBatch = 32;
 
     while (!sends_.empty() && fd_ >= 0) {
-      SendItem& item = sends_.front();
-      ssize_t count = 0;
+      const unsigned int batch_n = std::min<unsigned int>(sends_.size(), kSendBatch);
+      std::vector<sockaddr_storage> targets(batch_n);  // 每个 item 独立目标地址
+      std::vector<iovec> iovecs(batch_n);
+      std::vector<mmsghdr> mmsghdrs(batch_n);
+      std::vector<std::size_t> indices(batch_n);  // 记录 sends_ 里第几个
 
-      if (item.has_destination) {
-        sockaddr_storage storage{};
-        int length = 0;
-        if (!AddressCodec::to_native(item.destination, storage, length)) {
-          WriteCallback callback = std::move(item.callback);
+      unsigned int idx = 0;
+      for (auto it = sends_.begin(); idx < batch_n && it != sends_.end(); ++it, ++idx) {
+        if (!it->has_destination) {
+          break;
+        }
+        int addr_len = 0;
+        if (!AddressCodec::to_native(it->destination, targets[idx], addr_len)) {
+          auto callback = std::move(it->callback);
+          auto keeps = std::move(it->keepalive);
+          auto owned = std::move(it->owned);
+          it = sends_.erase(it);
           if (callback) {
-            callback(std::unexpected(make_error(ErrorCode::InvalidArgument)));
+            loop_->post([callback = std::move(callback), keeps = std::move(keeps),
+                         owned = std::move(owned)]() mutable {
+              callback(std::unexpected(make_error(ErrorCode::InvalidArgument)));
+            });
           }
-          sends_.pop_front();
+          --idx;
           continue;
         }
-        count = ::sendto(fd_,
-                         item.data,
-                         item.size,
-                         0,
-                         reinterpret_cast<sockaddr*>(&storage),
-                         static_cast<socklen_t>(length));
-      } else {
-        count = ::send(fd_, item.data, item.size, 0);
+
+        iovecs[idx].iov_base = const_cast<char*>(reinterpret_cast<const char*>(it->data));
+        iovecs[idx].iov_len = it->size;
+
+        mmsghdrs[idx].msg_hdr.msg_name = &targets[idx];
+        mmsghdrs[idx].msg_hdr.msg_namelen = addr_len;
+        mmsghdrs[idx].msg_hdr.msg_iov = &iovecs[idx];
+        mmsghdrs[idx].msg_hdr.msg_iovlen = 1;
+        mmsghdrs[idx].msg_hdr.msg_control = nullptr;
+        mmsghdrs[idx].msg_hdr.msg_controllen = 0;
+        mmsghdrs[idx].msg_hdr.msg_flags = 0;
+        mmsghdrs[idx].msg_len = 0;
+
+        indices[idx] = idx;  // 对应 sends_ 的第 idx 个
       }
 
-      if (count >= 0) {
-        WriteCallback callback = std::move(item.callback);
-        auto keepalive = std::move(item.keepalive);
-        auto owned = std::move(item.owned);
-        sends_.pop_front();
-        if (callback) {
-          // 与 Windows/IOCP 语义一致：发送完成回调异步投递，避免调用方递归；
-          // 同时把底层存储保持到回调执行。
-          loop_->post([callback = std::move(callback),
-                       keepalive = std::move(keepalive),
-                       owned = std::move(owned)]() mutable { callback({}); });
+      if (idx == 0) {
+        // 全是 connected UDP，走原有 send 单条逻辑（保留兼容）
+        break;
+      }
+
+      const int sent = ::sendmmsg(fd_, mmsghdrs.data(), idx, 0);
+
+      if (sent > 0) {
+        // sendmmsg 成功 sent 个 — 处理这 sent 个回调 + pop
+        for (int i = 0; i < sent; ++i) {
+          auto& item = sends_.front();
+          WriteCallback callback = std::move(item.callback);
+          auto keepalive = std::move(item.keepalive);
+          auto owned = std::move(item.owned);
+          sends_.pop_front();
+          if (callback) {
+            loop_->post([callback = std::move(callback),
+                         keepalive = std::move(keepalive),
+                         owned = std::move(owned)]() mutable { callback({}); });
+          }
+        }
+        // 如果 batch 里还有未 send 的（EAGAIN 之前可能发了一部分），退出等 EPOLLOUT
+        if (static_cast<unsigned int>(sent) < idx) {
+          break;
         }
         continue;
       }
@@ -696,6 +728,37 @@ class UdpSocketImpl final : public IoWatcher,
         break;
       }
 
+      fail_sends(from_socket_error(error));
+      return;
+    }
+
+    // 处理 connected UDP 的非 batch 残留（只有 connected_ 时才会进这里）
+    while (!sends_.empty() && fd_ >= 0) {
+      SendItem& item = sends_.front();
+      if (item.has_destination) {
+        // 带目标地址的在上面已经 sendmmsg 处理过了
+        break;
+      }
+      const ssize_t count = ::send(fd_, item.data, item.size, 0);
+      if (count >= 0) {
+        WriteCallback callback = std::move(item.callback);
+        auto keepalive = std::move(item.keepalive);
+        auto owned = std::move(item.owned);
+        sends_.pop_front();
+        if (callback) {
+          loop_->post([callback = std::move(callback),
+                       keepalive = std::move(keepalive),
+                       owned = std::move(owned)]() mutable { callback({}); });
+        }
+        continue;
+      }
+      const int error = errno;
+      if (error == EINTR) {
+        continue;
+      }
+      if (error == EAGAIN || error == EWOULDBLOCK) {
+        break;
+      }
       fail_sends(from_socket_error(error));
       return;
     }
