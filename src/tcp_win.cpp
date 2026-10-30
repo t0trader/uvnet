@@ -1262,7 +1262,9 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
 
   void handle_accept(AcceptOp* operation, DWORD error) {
     --pending_ops_;
-    accept_operation_ = nullptr;
+    // 从 pending list 移除（同步成功时可能已被 post_accept 移除过，忽略）
+    accept_ops_.erase(std::remove(accept_ops_.begin(), accept_ops_.end(), operation),
+                      accept_ops_.end());
 
     if (closing_) {
       (void)::closesocket(operation->accept_socket);
@@ -1349,61 +1351,65 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
     if (socket_ == INVALID_SOCKET || !listening_ || closing_) {
       return false;
     }
-    if (accept_operation_ != nullptr) {
-      return true;
-    }
 
-    const SOCKET accepted =
-        ::WSASocketW(AddressCodec::native_family(family_),
-                     SOCK_STREAM,
-                     IPPROTO_TCP,
-                     nullptr,
-                     0,
-                     WSA_FLAG_OVERLAPPED);
-    if (accepted == INVALID_SOCKET) {
-      return false;
-    }
-
-    auto* operation = new AcceptOp{};
-    operation->owner = shared_from_this();
-    operation->file = reinterpret_cast<HANDLE>(socket_);
-    operation->accept_socket = accepted;
-    accept_operation_ = operation;
-    ++pending_ops_;
-
-    DWORD bytes = 0;
-    const BOOL ok = g_acceptex(socket_,
-                               accepted,
-                               operation->buffer,
-                               0,
-                               kAcceptAddressLength,
-                               kAcceptAddressLength,
-                               &bytes,
-                               &operation->ov);
-
-    if (ok == FALSE) {
-      const int error = WSAGetLastError();
-      if (error != WSA_IO_PENDING) {
-        accept_operation_ = nullptr;
-        --pending_ops_;
-        (void)::closesocket(accepted);
-        operation->accept_socket = INVALID_SOCKET;
-        delete operation;
+    // 维护多个 outstanding AcceptOp — 多短连接同时到来时不再排队
+    static constexpr std::size_t kMaxAcceptOps = 4;
+    while (accept_ops_.size() < kMaxAcceptOps) {
+      const SOCKET accepted =
+          ::WSASocketW(AddressCodec::native_family(family_),
+                       SOCK_STREAM,
+                       IPPROTO_TCP,
+                       nullptr,
+                       0,
+                       WSA_FLAG_OVERLAPPED);
+      if (accepted == INVALID_SOCKET) {
         return false;
       }
-    } else {
-      // 同步成功时 FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 不会投递完成包
-      // 通过 post 走完成路径，避免递归 submit→drain→submit 爆栈
-      (void)bytes;
-      accept_operation_ = nullptr;
-      operation->completed_synchronically = true;
-      auto loop = loop_;
-      loop_->post([operation, loop] {
-        operation->on_complete(*loop, 0);
-        delete operation;
-      });
-    }
 
+      auto* operation = new AcceptOp{};
+      operation->owner = shared_from_this();
+      operation->file = reinterpret_cast<HANDLE>(socket_);
+      operation->accept_socket = accepted;
+      accept_ops_.push_back(operation);
+      ++pending_ops_;
+
+      DWORD bytes = 0;
+      const BOOL ok = g_acceptex(socket_,
+                                 accepted,
+                                 operation->buffer,
+                                 0,
+                                 kAcceptAddressLength,
+                                 kAcceptAddressLength,
+                                 &bytes,
+                                 &operation->ov);
+
+      if (ok == FALSE) {
+        const int error = WSAGetLastError();
+        if (error != WSA_IO_PENDING) {
+          // 提交失败，移除 + 清理
+          accept_ops_.pop_back();
+          --pending_ops_;
+          (void)::closesocket(accepted);
+          operation->accept_socket = INVALID_SOCKET;
+          delete operation;
+          return accept_ops_.empty();  // 如果全空了就报告失败，否则继续补其他
+        }
+      } else {
+        // 同步成功时 FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 不会投递完成包
+        // 通过 post 走完成路径，避免递归 submit→drain→submit 爆栈
+        auto it = std::find(accept_ops_.begin(), accept_ops_.end(), operation);
+        if (it != accept_ops_.end()) {
+          accept_ops_.erase(it);  // 从 pending list 移除
+        }
+        // 注意：不 --pending_ops_，保留给 handle_accept 去减（与原来单槽行为一致）
+        operation->completed_synchronically = true;
+        auto loop = loop_;
+        loop_->post([operation, loop] {
+          operation->on_complete(*loop, 0);
+          delete operation;
+        });
+      }
+    }
     return true;
   }
 
@@ -1464,7 +1470,7 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
   bool work_ref_ = false;
   int pending_ops_ = 0;
   AcceptCallback accept_callback_;
-  AcceptOp* accept_operation_ = nullptr;
+  std::vector<AcceptOp*> accept_ops_;
 };
 
 void AcceptOp::on_complete(LoopImpl&, DWORD error) {
