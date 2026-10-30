@@ -454,6 +454,11 @@ class TcpStreamImpl final : public IoWatcher,
     loop_->begin_work();
     work_ref_ = true;
 
+    // 默认 TCP 收发缓冲 256KB：适配高带宽延迟积场景；失败仅 warn
+    constexpr int kDefaultTcpBuf = 256 * 1024;
+    (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &kDefaultTcpBuf, sizeof(kDefaultTcpBuf));
+    (void)::setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &kDefaultTcpBuf, sizeof(kDefaultTcpBuf));
+
     if (nodelay_) {
       const int value = 1;
       (void)::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
@@ -789,7 +794,7 @@ class TcpStreamImpl final : public IoWatcher,
   bool work_ref_ = false;
   std::uint32_t interest_ = 0;
 
-  bool nodelay_ = false;
+  bool nodelay_ = true;  // 默认开启 TCP_NODELAY，避免 Nagle 攒包延迟
   KeepAliveOptions keepalive_{false, std::chrono::seconds(60)};
 
   ReadCallback read_callback_;
