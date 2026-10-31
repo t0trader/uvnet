@@ -11,7 +11,7 @@ namespace {
 
 using namespace uvnet;
 
-// 默认后端；命令行传 readiness / iocp / epoll 可指定
+// 默认后端；命令行传 readiness / select / iocp / epoll 可指定
 Backend g_backend = Backend::Unknown;
 
 const char* backend_name(Backend backend) {
@@ -20,6 +20,8 @@ const char* backend_name(Backend backend) {
       return "iocp";
     case Backend::Readiness:
       return "readiness";
+    case Backend::Select:
+      return "select";
     case Backend::Epoll:
       return "epoll";
     default:
@@ -294,6 +296,8 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "readiness") == 0) {
       g_backend = Backend::Readiness;
+    } else if (std::strcmp(argv[i], "select") == 0) {
+      g_backend = Backend::Select;
     } else if (std::strcmp(argv[i], "iocp") == 0) {
       g_backend = Backend::Iocp;
     } else if (std::strcmp(argv[i], "epoll") == 0) {

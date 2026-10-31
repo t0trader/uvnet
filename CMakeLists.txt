@@ -19,6 +19,7 @@ if(WIN32)
   target_sources(uvnet PRIVATE
     src/loop_win.cpp
     src/poller_win_ready.cpp
+    src/poller_win_select.cpp
     src/tcp_win.cpp
     src/tcp_win_ready.cpp
     src/udp_win.cpp

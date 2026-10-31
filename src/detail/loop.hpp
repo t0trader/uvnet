@@ -108,6 +108,8 @@ class LoopImpl : public std::enable_shared_from_this<LoopImpl> {
   Backend requested_backend_ = Backend::Unknown;
   std::deque<std::function<void()>> pending_;
   mutable std::mutex pending_mutex_;
+  // pending_ 的无锁快速判断：为空时跳过每轮 flush_pending 的加锁
+  std::atomic<bool> has_pending_{false};
   bool wake_pending_ = false;
   std::vector<TimerImpl*> timer_heap_;
   std::thread::id thread_id_;

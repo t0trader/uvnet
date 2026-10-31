@@ -1441,14 +1441,16 @@ std::shared_ptr<TcpListenerImpl> create_iocp_listener_impl(std::shared_ptr<LoopI
 }
 
 std::shared_ptr<TcpStreamImpl> create_tcp_stream_impl(std::shared_ptr<LoopImpl> loop) {
-  if (loop->backend() == Backend::Readiness) {
+  const Backend backend = loop->backend();
+  if (backend == Backend::Readiness || backend == Backend::Select) {
     return create_ready_stream_impl(std::move(loop));
   }
   return create_iocp_stream_impl(std::move(loop));
 }
 
 std::shared_ptr<TcpListenerImpl> create_tcp_listener_impl(std::shared_ptr<LoopImpl> loop) {
-  if (loop->backend() == Backend::Readiness) {
+  const Backend backend = loop->backend();
+  if (backend == Backend::Readiness || backend == Backend::Select) {
     return create_ready_listener_impl(std::move(loop));
   }
   return create_iocp_listener_impl(std::move(loop));

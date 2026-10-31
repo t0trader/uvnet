@@ -981,7 +981,8 @@ std::shared_ptr<UdpSocketImpl> create_iocp_udp_socket_impl(std::shared_ptr<LoopI
 std::shared_ptr<UdpSocketImpl> create_udp_socket_impl(std::shared_ptr<LoopImpl> loop,
                                                       Family family,
                                                       const UdpOptions& options) {
-  if (loop->backend() == Backend::Readiness) {
+  const Backend backend = loop->backend();
+  if (backend == Backend::Readiness || backend == Backend::Select) {
     return create_ready_udp_socket_impl(std::move(loop), family, options);
   }
   return create_iocp_udp_socket_impl(std::move(loop), family, options);

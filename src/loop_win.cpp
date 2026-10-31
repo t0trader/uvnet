@@ -136,6 +136,9 @@ std::unique_ptr<Poller> create_poller(Backend backend) {
   if (backend == Backend::Readiness) {
     return std::make_unique<ReadyPoller>();
   }
+  if (backend == Backend::Select) {
+    return std::make_unique<SelectPoller>();
+  }
   return std::make_unique<IocpPoller>();
 }
 

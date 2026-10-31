@@ -95,7 +95,7 @@ void test_numeric(Backend backend) {
 
 int main() {
 #if defined(_WIN32)
-  const Backend backends[] = {Backend::Iocp, Backend::Readiness};
+  const Backend backends[] = {Backend::Iocp, Backend::Readiness, Backend::Select};
 #else
   const Backend backends[] = {Backend::Epoll};
 #endif

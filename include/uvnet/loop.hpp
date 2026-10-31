@@ -21,6 +21,10 @@ enum class Backend : std::uint8_t {
   Iocp,
   // Windows：wepoll 就绪通知 + 非阻塞 recv/send，延迟优先，TCP/UDP 均可用
   Readiness,
+  // Windows：select() 就绪通知 + 非阻塞 recv/send，面向单连接/少量句柄的
+  // 低延迟客户端；受 FD_SETSIZE 限制（最多 63 个句柄），仅建议小规模使用。
+  // Linux 上传入该值会回落到 Epoll。
+  Select,
 };
 
 // 单线程事件循环。所有句柄操作都必须在循环线程执行，
@@ -29,7 +33,7 @@ class Loop {
  public:
   // 平台默认后端：Windows 为 Iocp，Linux 为 Epoll
   Loop();
-  // 显式选择后端；Linux 上只支持 Epoll，传入其他值会被忽略
+  // 显式选择后端；Linux 上只支持 Epoll，传入 Readiness/Select 会被忽略
   explicit Loop(Backend backend);
   ~Loop();
 

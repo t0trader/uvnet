@@ -9,6 +9,9 @@
 - Windows 可选第二套后端：`Loop(Backend::Readiness)` 走 wepoll 就绪通知 +
   非阻塞 `recv`/`send`、`recvfrom`/`sendto`，pingpong 延迟更低（见性能一节）；
   默认仍是 IOCP，两套后端按 Loop 选择，不可在同一 Loop 内混用
+- Windows 可选第三套后端：`Loop(Backend::Select)` 复用同一套就绪式 TCP/UDP 实现，
+  只把 poller 换成 `select()`，面向单连接/少量句柄的低延迟客户端；
+  受 `FD_SETSIZE` 限制（最多 63 个句柄），Linux 上传入会回落到 epoll
 - IPv4 / IPv6，TCP 与 UDP
 - 异步 DNS：线程池 + `getaddrinfo` / `getnameinfo`，回调回到循环线程
 - TCP：bind / listen / accept / connect / read / write / shutdown / RST 关闭、
@@ -29,6 +32,9 @@
   回环/短连接高频路径开启 `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` +
   `FILE_SKIP_SET_EVENT_ON_HANDLE`，命中时省一次内核态切换和 IOCP 投包
 - Windows 监听器 4 个 outstanding AcceptEx 预投递，短连接 QPS +20–40%
+- 就绪式后端（Readiness/Select）写队列空闲时直接 `send` 并同步回调，不分配写项、
+  不经过写队列；部分发送才入队。Loop 对跨线程 `post` 队列用原子标志做无锁快速判断
+- Windows Select 后端每次 poll 用固定容量快照分发事件，热路径无堆分配
 - Windows UDP 发送 4 个并发 WSASendTo（而不是单槽串行），loopback pps +70%
 - Linux UDP `recvmmsg` / `sendmmsg` 批量收发（N=32），真实网卡 syscall 数降 32×
 - 读窗口可配置：`TcpStream::set_read_options`（`slots` / `chunk_size`）、
@@ -200,8 +206,10 @@ stream->start_read([](Result<std::span<const std::byte>> chunk) {
   零拷贝模式按需取块；未启动读写时不分配
 - 关闭 TCP 连接时，排队中的写回调会收到 `ErrorCode::Canceled`；
   监听器关闭不会再次触发 accept 回调
-- 后端选择：`Loop()` 默认 IOCP（Linux 为 epoll）；`Loop(Backend::Readiness)` 在
-  Windows 上启用就绪式 TCP/UDP，延迟优先、吞吐低于 IOCP
+- 后端选择：`Loop()` 默认 IOCP（Linux 为 epoll）；`Loop(Backend::Readiness)` /
+  `Loop(Backend::Select)` 在 Windows 上启用就绪式 TCP/UDP（wepoll / select），
+  延迟优先、吞吐低于 IOCP；Select 受 `FD_SETSIZE` 限制（最多 63 个句柄），
+  Linux 上传入 Readiness/Select 会回落到 epoll
 
 ## 性能
 
@@ -250,6 +258,30 @@ wepoll 就绪通知 + 非阻塞收发，省掉 overlapped 提交与完成包往�
 批量后等待次数约降到 1/batch，64 B 吞吐从 ~52 kpps 回到 ~80 kpps，pingpong 不变。
 
 低延迟场景选 Readiness，吞吐优先选默认 IOCP。
+
+### select 后端（Windows，`uvnet_bench_tcp.exe select` / `uvnet_bench_udp.exe select`）
+
+与 Readiness 共用同一套就绪式 TCP/UDP 实现，只把 poller 换成 `select()`。
+定位是单连接/少量句柄的低延迟客户端：不依赖 wepoll，注册表就是几个句柄；
+上限 63 个句柄（`FD_SETSIZE` 减去唤醒套接字）。
+
+| TCP 场景（同场对比） | Select | Readiness |
+|---|---|---|
+| pingpong 64 B RTT p50 | 7.9–8.0 µs | 8.3 µs |
+| echo 16 KB | 416–559 MiB/s | 600–636 MiB/s |
+| echo 64 KB | 567–602 MiB/s | 706–741 MiB/s |
+
+| UDP 场景（同场对比） | Select | Readiness |
+|---|---|---|
+| 64 B 吞吐 | ~109 kpps | ~109 kpps |
+| 1024 B 吞吐 | ~108–111 kpps | ~108 kpps |
+| pingpong 64 B RTT p50 | 10.8 µs | 10.8 µs |
+
+独立的最小 select 原型能到 p50 7.2 µs。把写队列空闲时的直发快路径、poller 零堆分配
+和 Loop 的无锁 pending 判断补上后，入库版本从 8.3–8.4 µs 降到 7.9–8.0 µs，
+与原型相差约 0.6–0.7 µs；剩余差距主要是 keepalive 缓冲池与回调封装。
+它的价值在“不依赖 wepoll、路径最短”，而不是大幅降延迟；句柄数超过几十个时用
+Readiness/IOCP。
 
 ### UDP（Windows loopback，默认 4 槽收 + 4 并发发）
 

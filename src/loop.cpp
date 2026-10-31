@@ -137,6 +137,7 @@ void LoopImpl::post(std::function<void()> fn) {
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_.push_back(std::move(fn));
+    has_pending_.store(true, std::memory_order_release);
     if (!on_loop_thread && !wake_pending_) {
       wake_pending_ = true;
       need_wake = true;
@@ -149,10 +150,16 @@ void LoopImpl::post(std::function<void()> fn) {
 }
 
 void LoopImpl::flush_pending() {
+  // 常见路径没有跨线程投递，先做一次无锁判断，避免每轮都抢锁
+  if (!has_pending_.load(std::memory_order_acquire)) {
+    return;
+  }
+
   std::deque<std::function<void()>> local;
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     local.swap(pending_);
+    has_pending_.store(false, std::memory_order_release);
     wake_pending_ = false;
   }
 
@@ -283,18 +290,17 @@ std::optional<std::chrono::milliseconds> LoopImpl::next_timeout(
     std::optional<std::chrono::milliseconds> max_wait) const {
   std::optional<std::chrono::milliseconds> timeout;
 
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (!pending_.empty()) {
-      timeout = std::chrono::milliseconds(0);
-    } else if (!timer_heap_.empty()) {
-      const auto delta = timer_heap_.front()->deadline_ - now_ms_;
-      timeout = delta.count() > 0 ? delta : std::chrono::milliseconds(0);
-    } else if (work_count_.load(std::memory_order_relaxed) > 0) {
-      timeout = std::nullopt;
-    } else {
-      timeout = std::chrono::milliseconds(0);
-    }
+  // pending_ 用原子标志做快速判断（定时器堆只在循环线程访问，无需加锁）；
+  // 跨线程 post 会同时调用 wake()，即使这里读到旧值也能被唤醒后及时处理
+  if (has_pending_.load(std::memory_order_acquire)) {
+    timeout = std::chrono::milliseconds(0);
+  } else if (!timer_heap_.empty()) {
+    const auto delta = timer_heap_.front()->deadline_ - now_ms_;
+    timeout = delta.count() > 0 ? delta : std::chrono::milliseconds(0);
+  } else if (work_count_.load(std::memory_order_relaxed) > 0) {
+    timeout = std::nullopt;
+  } else {
+    timeout = std::chrono::milliseconds(0);
   }
 
   if (max_wait) {

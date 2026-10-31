@@ -208,6 +208,35 @@ class ReadyTcpStreamImpl final : public TcpStreamImpl,
       return {};
     }
 
+    // 写队列空闲时直接发送：成功后同步回调，省掉写项分配与 deque 操作。
+    // 部分发送才回落到排队路径，只把剩余字节拷进队列。
+    if (writes_.empty() && !flushing_) {
+      const int n = ::send(socket_,
+                           reinterpret_cast<const char*>(data.data()),
+                           static_cast<int>(data.size()),
+                           0);
+      if (n > 0) {
+        const std::size_t sent = static_cast<std::size_t>(n);
+        if (sent == data.size()) {
+          if (callback) {
+            callback({});
+          }
+          return {};
+        }
+        ReadyWriteItem* item = acquire_write_item();
+        item->owned.assign(data.data() + sent, data.data() + data.size());
+        item->data = item->owned.data();
+        item->size = item->owned.size();
+        item->offset = 0;
+        item->keepalive.reset();
+        item->callback = std::move(callback);
+        writes_.push_back(item);
+        flush_writes();
+        return {};
+      }
+      // n == 0 或 WSAEWOULDBLOCK：回落到正常排队路径
+    }
+
     ReadyWriteItem* item = acquire_write_item();
     item->owned.assign(data.begin(), data.end());
     item->data = item->owned.data();
@@ -230,6 +259,33 @@ class ReadyTcpStreamImpl final : public TcpStreamImpl,
     }
     if (buffer.data.empty()) {
       return {};
+    }
+
+    // 同 write(span)：队列空闲时直接发送，部分发送才入队
+    if (writes_.empty() && !flushing_) {
+      const int n = ::send(socket_,
+                           reinterpret_cast<const char*>(buffer.data.data()),
+                           static_cast<int>(buffer.data.size()),
+                           0);
+      if (n > 0) {
+        const std::size_t sent = static_cast<std::size_t>(n);
+        if (sent == buffer.data.size()) {
+          if (callback) {
+            callback({});
+          }
+          return {};
+        }
+        ReadyWriteItem* item = acquire_write_item();
+        item->owned.clear();
+        item->data = buffer.data.data() + sent;
+        item->size = buffer.data.size() - sent;
+        item->offset = 0;
+        item->keepalive = std::move(buffer.keepalive);
+        item->callback = std::move(callback);
+        writes_.push_back(item);
+        flush_writes();
+        return {};
+      }
     }
 
     ReadyWriteItem* item = acquire_write_item();
