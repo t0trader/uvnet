@@ -1,6 +1,6 @@
 # uvnet
 
-从 libuv 分离出来的独立跨平台 C++ 网络库，不依赖 libuv，使用 C++23 `std::expected` 风格 API。
+独立的跨平台 C++ 网络库，使用 C++23 `std::expected` 风格 API。
 
 ## 特性
 
