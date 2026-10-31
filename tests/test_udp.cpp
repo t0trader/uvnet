@@ -109,6 +109,7 @@ void test_connected_send(Backend backend, Family family) {
   const auto bound = server.bind(SocketAddress::loopback(family, 0));
   if (!bound) {
     if (family == Family::IPv6) {
+      std::printf("[skip] IPv6 UDP 不可用: %s\n", bound.error().message().c_str());
       return;
     }
     CHECK(false);
@@ -156,21 +157,29 @@ void test_connected_send(Backend backend, Family family) {
 }
 
 // 突发多包：验证一次可读事件里连续收多个 datagram 时不丢包、不串内容
-void test_burst(Backend backend) {
+void test_burst(Backend backend, Family family) {
   Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(5));
   constexpr int kCount = 16;
 
-  UdpSocket server(loop);
-  CHECK_OK(server.bind(SocketAddress::loopback(Family::IPv4, 0)));
+  UdpSocket server(loop, family);
+  const auto server_bound = server.bind(SocketAddress::loopback(family, 0));
+  if (!server_bound) {
+    if (family == Family::IPv6) {
+      std::printf("[skip] IPv6 UDP 不可用: %s\n", server_bound.error().message().c_str());
+      return;
+    }
+    CHECK(false);
+    return;
+  }
   const auto address = server.local_address();
   if (!address) {
     CHECK(false);
     return;
   }
 
-  UdpSocket client(loop);
-  CHECK_OK(client.bind(SocketAddress::loopback(Family::IPv4, 0)));
+  UdpSocket client(loop, family);
+  CHECK_OK(client.bind(SocketAddress::loopback(family, 0)));
   CHECK_OK(client.connect(*address));
 
   int server_received = 0;
@@ -248,7 +257,9 @@ int main() {
     test_echo(backend, Family::IPv4);
     test_echo(backend, Family::IPv6);
     test_connected_send(backend, Family::IPv4);
-    test_burst(backend);
+    test_connected_send(backend, Family::IPv6);
+    test_burst(backend, Family::IPv4);
+    test_burst(backend, Family::IPv6);
   }
   return uvtest::finish("udp");
 }
