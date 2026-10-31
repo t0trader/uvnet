@@ -7,8 +7,8 @@ namespace {
 
 using namespace uvnet;
 
-void test_timers() {
-  Loop loop;
+void test_timers(Backend backend) {
+  Loop loop(backend);
   uvtest::Guard guard(loop);
 
   Timer first(loop);
@@ -59,8 +59,8 @@ void test_timers() {
   CHECK(order.front() == 3);
 }
 
-void test_async() {
-  Loop loop;
+void test_async(Backend backend) {
+  Loop loop(backend);
   uvtest::Guard guard(loop);
 
   int calls = 0;
@@ -80,21 +80,23 @@ void test_async() {
   CHECK(calls == 1);
 }
 
-void test_backend() {
-  Loop loop;
-
-#if defined(_WIN32)
-  CHECK(loop.backend() == Backend::Iocp);
-#else
-  CHECK(loop.backend() == Backend::Epoll);
-#endif
+void test_backend(Backend backend) {
+  Loop loop(backend);
+  CHECK(loop.backend() == backend);
 }
 
 } // namespace
 
 int main() {
-  test_backend();
-  test_timers();
-  test_async();
+#if defined(_WIN32)
+  const Backend backends[] = {Backend::Iocp, Backend::Readiness};
+#else
+  const Backend backends[] = {Backend::Epoll};
+#endif
+  for (const Backend backend : backends) {
+    test_backend(backend);
+    test_timers(backend);
+    test_async(backend);
+  }
   return uvtest::finish("loop");
 }

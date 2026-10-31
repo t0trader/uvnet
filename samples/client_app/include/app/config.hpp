@@ -25,7 +25,7 @@ struct Config {
   int connect_timeout_ms = 3000;  // 单个候选地址的连接超时
   int max_retries = 2;            // 连接失败/超时后的重试次数
 
-  std::size_t read_slots = 4;  // Windows 多 outstanding 读槽数量（Linux 忽略）
+  std::size_t read_slots = 4;  // Windows IOCP 多 outstanding 读槽数量；Linux/就绪式忽略
   std::size_t read_chunk = 32 * 1024;
 
   LogLevel log_level = LogLevel::Info;

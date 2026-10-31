@@ -26,8 +26,8 @@ void test_resolve_localhost(Resolver& resolver, int& done, uvtest::Guard& guard)
   });
 }
 
-void test_numeric() {
-  Loop loop;
+void test_numeric(Backend backend) {
+  Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(15));
   Resolver resolver(loop);
 
@@ -94,6 +94,13 @@ void test_numeric() {
 } // namespace
 
 int main() {
-  test_numeric();
+#if defined(_WIN32)
+  const Backend backends[] = {Backend::Iocp, Backend::Readiness};
+#else
+  const Backend backends[] = {Backend::Epoll};
+#endif
+  for (const Backend backend : backends) {
+    test_numeric(backend);
+  }
   return uvtest::finish("dns");
 }

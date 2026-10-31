@@ -16,6 +16,19 @@ constexpr std::chrono::milliseconds kTick{100};
 
 uvnet::Timer* g_interrupt_timer = nullptr; // 仅用于在中断回调里停表，避免额外捕获
 
+const char* backend_name(uvnet::Backend backend) {
+  switch (backend) {
+    case uvnet::Backend::Iocp:
+      return "IOCP (Windows)";
+    case uvnet::Backend::Readiness:
+      return "Readiness (Windows, wepoll)";
+    case uvnet::Backend::Epoll:
+      return "epoll (Linux)";
+    default:
+      return "unknown";
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -39,8 +52,7 @@ int main(int argc, char** argv) {
   app::platform::install_stop_handler();
 
   uvnet::Loop loop;
-  app::log_info(std::string("uvnet 后端: ") +
-                (loop.backend() == uvnet::Backend::Iocp ? "IOCP (Windows)" : "epoll (Linux)"));
+  app::log_info(std::string("uvnet 后端: ") + backend_name(loop.backend()));
 
   auto session = std::make_shared<app::ClientSession>(loop, config);
   session->start();

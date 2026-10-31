@@ -43,7 +43,7 @@ void print_usage(const char* program) {
       "  --timeout MS          单轮响应超时，毫秒（默认 3000）\n"
       "  --connect-timeout MS  单个地址的连接超时，毫秒（默认 3000）\n"
       "  --retries N           失败后的重试次数（默认 2）\n"
-      "  --slots N             读/收包槽位数量，Windows 生效（默认 4）\n"
+      "  --slots N             读/收包槽位数量，Windows IOCP 生效（默认 4）\n"
       "  --chunk BYTES         单次读缓冲字节数（默认 32768）\n"
       "  --log-level LEVEL     debug / info / warn / error（默认 info）\n"
       "  --help                显示本帮助\n",

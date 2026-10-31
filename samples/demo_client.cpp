@@ -43,6 +43,19 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using std::chrono::milliseconds;
 
+const char* backend_name(Backend backend) {
+  switch (backend) {
+    case Backend::Iocp:
+      return "IOCP";
+    case Backend::Readiness:
+      return "Readiness";
+    case Backend::Epoll:
+      return "epoll";
+    default:
+      return "unknown";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 平台适配层：整个示例里唯一需要区分平台的地方
 // ---------------------------------------------------------------------------
@@ -332,7 +345,7 @@ class TcpClient final : public std::enable_shared_from_this<TcpClient> {
     std::printf("已连接 %s\n", address.to_string().c_str());
 
     // 读窗口必须在第一次 start_read 之前配置。
-    // slots 只在 Windows 生效（多 outstanding 读），Linux 忽略。
+    // slots 只在 Windows IOCP 生效（多 outstanding 读），Linux/就绪式忽略。
     if (const auto applied =
             stream_.set_read_options(ReadOptions{.slots = 4, .chunk_size = 32 * 1024});
         !applied) {
@@ -348,7 +361,7 @@ class TcpClient final : public std::enable_shared_from_this<TcpClient> {
     if (const auto local = stream_.local_address()) {
       std::printf("本地地址 %s（后端: %s）\n",
                   local->to_string().c_str(),
-                  loop_.backend() == Backend::Iocp ? "IOCP" : "epoll");
+                  backend_name(loop_.backend()));
     }
 
     start_reading();
@@ -590,7 +603,7 @@ class UdpClient final : public std::enable_shared_from_this<UdpClient> {
       std::printf("本地地址 %s，目标 %s（后端: %s）\n",
                   local->to_string().c_str(),
                   target_.to_string().c_str(),
-                  loop_.backend() == Backend::Iocp ? "IOCP" : "epoll");
+                  backend_name(loop_.backend()));
     }
 
     send_next();
@@ -877,7 +890,7 @@ int main(int argc, char** argv) {
 
   Loop loop;
   std::printf("uvnet 示例 | 后端: %s | 协议: %s\n",
-              loop.backend() == Backend::Iocp ? "IOCP (Windows)" : "epoll (Linux)",
+              backend_name(loop.backend()),
               options.udp ? "UDP" : "TCP");
 
   if (options.server) {

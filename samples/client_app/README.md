@@ -82,7 +82,7 @@ ctest --test-dir build-client --output-on-failure
 --timeout MS          单轮响应超时（默认 3000），超时视为连接失效并重连
 --connect-timeout MS  单个候选地址的连接超时（默认 3000）
 --retries N           失败后的重试次数（默认 2），指数退避 200ms/400ms…
---slots N             读/收包槽位数量（默认 4，仅 Windows 生效）
+--slots N             读/收包槽位数量（默认 4，仅 Windows IOCP 生效）
 --chunk BYTES         单次读缓冲（默认 32768）
 --log-level LEVEL     debug / info / warn / error
 ```
