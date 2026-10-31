@@ -277,14 +277,6 @@ WSL2 虚拟化层掩盖实际收益；在裸 Linux + 真实 NIC 上预期 UDP �
 
 - C++23 标准；Windows 要求 `_WIN32_WINNT >= 0x0601`（Win7+）
 - 双平台 ASAN + UBSAN 全部通过（`UVNET_BUILD_TESTS=ON`）
-- 当前 7 个本地 commits，working tree clean
-
-```
-cedde1a  Linux UDP: sendmmsg batch send (N=32)
-24baef4  Linux UDP: recvmmsg batch receive (N=32)
-86561a0  Windows TCP: multi-outstanding AcceptEx (N=4)
-a008cf9  TCP: default TCP_NODELAY + SO_RCVBUF/SO_SNDBUF 256KB
-93ecf88  UDP: default SO_RCVBUF/SO_SNDBUF 256KB
-e7ab8d5  platform.hpp: _WIN32_WINNT 0x0601
-f4fdf03  Initial commit: uvnet
-```
+- 仓库根目录即本目录；提交历史见 `git log`
+- `samples/client_app` 是独立示例工程（自带 CMake），在仓库根执行
+  `cmake -S samples/client_app -B build-client` 构建
