@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <mutex>
 
+#include "detail/ready_poller.hpp"
+
 namespace uvnet::detail {
 
 namespace {
@@ -130,7 +132,10 @@ void IocpPoller::poll(std::optional<std::chrono::milliseconds> timeout) {
   }
 }
 
-std::unique_ptr<Poller> create_poller() {
+std::unique_ptr<Poller> create_poller(Backend backend) {
+  if (backend == Backend::Readiness) {
+    return std::make_unique<ReadyPoller>();
+  }
   return std::make_unique<IocpPoller>();
 }
 

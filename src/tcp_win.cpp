@@ -14,36 +14,18 @@
 #include "detail/buffer_pool.hpp"
 #include "detail/platform.hpp"
 #include "detail/poller_win.hpp"
+#include "detail/tcp_impl_win.hpp"
+#include "detail/win_socket.hpp"
 
 #include <mswsock.h>
 
 namespace uvnet {
 namespace {
 
-// 避免引入 mstcpip.h（部分 SDK 组合下会与 WIN32_LEAN_AND_MEAN 冲突）
-struct KeepAliveSetting {
-  ULONG onoff;
-  ULONG keepalivetime;
-  ULONG keepaliveinterval;
-};
-
-#ifndef SIO_KEEPALIVE_VALS
-#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
-#endif
-
 constexpr std::size_t kReadBufferSize = 64 * 1024;
 constexpr std::size_t kDefaultReadSlots = 4;
 inline constexpr std::size_t kMaxFreeWrites = 8;
 constexpr int kAcceptAddressLength = static_cast<int>(sizeof(SOCKADDR_STORAGE) + 16);
-
-// MSVC 的 Winsock 接口参数类型为 char*，统一做一次转换
-int socket_setopt(SOCKET socket, int level, int name, const void* value, int length) {
-  return ::setsockopt(socket, level, name, reinterpret_cast<const char*>(value), length);
-}
-
-int socket_getopt(SOCKET socket, int level, int name, void* value, int* length) {
-  return ::getsockopt(socket, level, name, reinterpret_cast<char*>(value), length);
-}
 
 std::once_flag g_extension_once;
 LPFN_ACCEPTEX g_acceptex = nullptr;
@@ -95,58 +77,6 @@ SOCKET create_tcp_socket(Family family) {
                       WSA_FLAG_OVERLAPPED);
 }
 
-VoidResult apply_bind_options(SOCKET socket, Family family, const BindOptions& options) {
-  if (options.reuse_port) {
-    return std::unexpected(detail::make_error(ErrorCode::OperationNotSupported,
-                                              WSAGetLastError()));
-  }
-
-  const int one = 1;
-  if (options.reuse_address &&
-      socket_setopt(socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
-    return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-  }
-
-  if (family == Family::IPv6) {
-    const int v6only = options.ipv6_only ? 1 : 0;
-    if (socket_setopt(socket, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
-      return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-    }
-  }
-
-  return {};
-}
-
-VoidResult apply_keepalive(SOCKET socket, const KeepAliveOptions& options) {
-  const int enable = options.enable ? 1 : 0;
-  if (socket_setopt(socket, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) != 0) {
-    return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-  }
-  if (!options.enable) {
-    return {};
-  }
-
-  KeepAliveSetting setting{};
-  setting.onoff = 1;
-  setting.keepalivetime = static_cast<ULONG>(std::max<std::int64_t>(
-      1, std::chrono::duration_cast<std::chrono::milliseconds>(options.delay).count()));
-  setting.keepaliveinterval = setting.keepalivetime;
-
-  DWORD bytes = 0;
-  if (::WSAIoctl(socket,
-                 SIO_KEEPALIVE_VALS,
-                 &setting,
-                 sizeof(setting),
-                 nullptr,
-                 0,
-                 &bytes,
-                 nullptr,
-                 nullptr) != 0) {
-    return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-  }
-  return {};
-}
-
 bool bind_wildcard(SOCKET socket, Family family) {
   sockaddr_storage storage{};
   int length = 0;
@@ -170,33 +100,15 @@ bool bind_wildcard(SOCKET socket, Family family) {
   return ::bind(socket, reinterpret_cast<sockaddr*>(&storage), length) == 0;
 }
 
-Result<SocketAddress> socket_local_address(SOCKET socket) {
-  sockaddr_storage storage{};
-  int length = sizeof(storage);
-  if (::getsockname(socket, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
-    return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-  }
-  return detail::AddressCodec::from_native(reinterpret_cast<sockaddr*>(&storage), length);
-}
-
-Result<SocketAddress> socket_peer_address(SOCKET socket) {
-  sockaddr_storage storage{};
-  int length = sizeof(storage);
-  if (::getpeername(socket, reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
-    return std::unexpected(detail::from_socket_error(WSAGetLastError()));
-  }
-  return detail::AddressCodec::from_native(reinterpret_cast<sockaddr*>(&storage), length);
-}
-
 } // namespace
 
 namespace detail {
 
-class TcpStreamImpl;
-class TcpListenerImpl;
+class IocpTcpStreamImpl;
+class IocpTcpListenerImpl;
 
 struct StreamReadOp final : WinOperation {
-  std::shared_ptr<TcpStreamImpl> owner;
+  std::shared_ptr<IocpTcpStreamImpl> owner;
   WSABUF wsabuf{};
   std::shared_ptr<const void> keepalive;
   std::size_t slot = 0;
@@ -209,7 +121,7 @@ struct StreamReadOp final : WinOperation {
 };
 
 struct StreamWriteOp final : WinOperation {
-  std::shared_ptr<TcpStreamImpl> owner;
+  std::shared_ptr<IocpTcpStreamImpl> owner;
   std::vector<std::byte> owned;
   const std::byte* external = nullptr;
   std::size_t external_size = 0;
@@ -229,16 +141,17 @@ struct ReadCompletion {
 };
 
 struct StreamConnectOp final : WinOperation {
-  std::shared_ptr<TcpStreamImpl> owner;
+  std::shared_ptr<IocpTcpStreamImpl> owner;
 
   void on_complete(LoopImpl& loop, DWORD error) override;
 };
 
-class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
+class IocpTcpStreamImpl final : public TcpStreamImpl,
+                                public std::enable_shared_from_this<IocpTcpStreamImpl> {
  public:
-  explicit TcpStreamImpl(std::shared_ptr<LoopImpl> loop) : loop_(std::move(loop)) {}
+  explicit IocpTcpStreamImpl(std::shared_ptr<LoopImpl> loop) : loop_(std::move(loop)) {}
 
-  ~TcpStreamImpl() { destroy(); }
+  ~IocpTcpStreamImpl() { destroy(); }
 
   VoidResult bind(const SocketAddress& local, const BindOptions& options) {
     if (socket_ != INVALID_SOCKET && (connecting_ || connected_)) {
@@ -248,7 +161,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
       return std::unexpected(make_error(ErrorCode::InvalidArgument));
     }
 
-    auto applied = apply_bind_options(socket_, local.family(), options);
+    auto applied = win_apply_bind_options(socket_, local.family(), options);
     if (!applied) {
       return applied;
     }
@@ -490,14 +403,14 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     if (socket_ == INVALID_SOCKET) {
       return std::unexpected(make_error(ErrorCode::BadFileDescriptor));
     }
-    return socket_local_address(socket_);
+    return win_socket_local_address(socket_);
   }
 
   Result<SocketAddress> peer_address() const {
     if (socket_ == INVALID_SOCKET) {
       return std::unexpected(make_error(ErrorCode::BadFileDescriptor));
     }
-    return socket_peer_address(socket_);
+    return win_socket_peer_address(socket_);
   }
 
   VoidResult set_nodelay(bool enable) {
@@ -506,7 +419,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
       return {};
     }
     const int value = enable ? 1 : 0;
-    if (socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) != 0) {
+    if (win_socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value)) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
     return {};
@@ -517,7 +430,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     if (socket_ == INVALID_SOCKET) {
       return {};
     }
-    return apply_keepalive(socket_, options);
+    return win_apply_keepalive(socket_, options);
   }
 
   Result<int> recv_buffer_size() const {
@@ -526,7 +439,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     }
     int value = 0;
     int length = sizeof(value);
-    if (socket_getopt(socket_, SOL_SOCKET, SO_RCVBUF, &value, &length) != 0) {
+    if (win_socket_getopt(socket_, SOL_SOCKET, SO_RCVBUF, &value, &length) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
     return value;
@@ -536,7 +449,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     if (socket_ == INVALID_SOCKET) {
       return std::unexpected(make_error(ErrorCode::BadFileDescriptor));
     }
-    if (socket_setopt(socket_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) != 0) {
+    if (win_socket_setopt(socket_, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
     return {};
@@ -548,7 +461,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     }
     int value = 0;
     int length = sizeof(value);
-    if (socket_getopt(socket_, SOL_SOCKET, SO_SNDBUF, &value, &length) != 0) {
+    if (win_socket_getopt(socket_, SOL_SOCKET, SO_SNDBUF, &value, &length) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
     return value;
@@ -558,7 +471,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     if (socket_ == INVALID_SOCKET) {
       return std::unexpected(make_error(ErrorCode::BadFileDescriptor));
     }
-    if (socket_setopt(socket_, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) != 0) {
+    if (win_socket_setopt(socket_, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
     return {};
@@ -574,10 +487,10 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
 
     if (nodelay_) {
       const int value = 1;
-      (void)socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+      (void)win_socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
     }
     if (keepalive_.enable) {
-      (void)apply_keepalive(socket_, keepalive_);
+      (void)win_apply_keepalive(socket_, keepalive_);
     }
   }
 
@@ -594,9 +507,24 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     }
 
     const std::size_t bytes = static_cast<std::size_t>(operation->ov.InternalHigh);
+    const int completion_error = static_cast<int>(error);
+    const bool completion_eof = error == 0 && bytes == 0;
+
+    // 常见情况：完成顺序与提交顺序一致，直接交付，完全跳过环形槽的记账；
+    // 只有真正乱序的完成才落环，等前序补洞后由 drain_reads 交付
+    if (operation->sequence == next_deliver_seq_) {
+      ++next_deliver_seq_;
+      deliver_read(operation, bytes, completion_error, completion_eof);
+      if (ring_pending_ != 0) {
+        drain_reads();
+      }
+      return;
+    }
+
     operation->completed_pending = true;
-    read_completions_[operation->sequence % read_slots_] = ReadCompletion{
-        operation, bytes, static_cast<int>(error), error == 0 && bytes == 0, true};
+    read_completions_[static_cast<std::size_t>(operation->sequence % read_slots_)] =
+        ReadCompletion{operation, bytes, completion_error, completion_eof, true};
+    ++ring_pending_;
     drain_reads();
   }
 
@@ -670,7 +598,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
 
     if (error == 0) {
       connected_ = true;
-      (void)socket_setopt(socket_, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
+      (void)win_socket_setopt(socket_, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0);
       if (callback) {
         callback({});
       }
@@ -710,17 +638,17 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
 
     // 默认 TCP 收发缓冲 256KB：适配高带宽延迟积场景；失败仅 warn
     constexpr int kDefaultTcpBuf = 256 * 1024;
-    (void)socket_setopt(socket_, SOL_SOCKET, SO_RCVBUF,
+    (void)win_socket_setopt(socket_, SOL_SOCKET, SO_RCVBUF,
                         &kDefaultTcpBuf, sizeof(kDefaultTcpBuf));
-    (void)socket_setopt(socket_, SOL_SOCKET, SO_SNDBUF,
+    (void)win_socket_setopt(socket_, SOL_SOCKET, SO_SNDBUF,
                         &kDefaultTcpBuf, sizeof(kDefaultTcpBuf));
 
     if (nodelay_) {
       const int value = 1;
-      (void)socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
+      (void)win_socket_setopt(socket_, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
     }
     if (keepalive_.enable) {
-      (void)apply_keepalive(socket_, keepalive_);
+      (void)win_apply_keepalive(socket_, keepalive_);
     }
     return true;
   }
@@ -830,11 +758,65 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
     }
   }
 
-  // 多 outstanding 读完成顺序不保证，按提交序号在固定环形槽中重排后交付
-  void drain_reads() {
-    auto self = shared_from_this();
+  enum class ReadDelivery { resubmitted, consumed, stopped };
 
-    while (!closing_) {
+  // 交付一个已完成读：回调用户并在读仍继续时重新提交该槽
+  ReadDelivery deliver_read(StreamReadOp* operation, std::size_t bytes, int error, bool eof) {
+    operation->completed_pending = false;
+    auto keepalive = std::move(operation->keepalive);
+
+    if (!reading_) {
+      // 读已停止：只消费完成，保持交付游标继续前进
+      if (error == 0 && eof) {
+        eof_ = true;
+      }
+      return ReadDelivery::consumed;
+    }
+
+    if (error != 0) {
+      reading_ = false;
+      keepalive.reset();
+      deliver_read_error(from_socket_error(error));
+      return ReadDelivery::stopped;
+    }
+
+    if (eof) {
+      eof_ = true;
+      reading_ = false;
+      keepalive.reset();
+      deliver_read_error(make_error(ErrorCode::EndOfFile));
+      return ReadDelivery::stopped;
+    }
+
+    if (!keepalive_reads_) {
+      auto span_callback = span_callback_;
+      if (span_callback) {
+        span_callback(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(operation->wsabuf.buf), bytes));
+      }
+    } else {
+      auto callback = read_callback_;
+      if (callback) {
+        callback(ReadChunk{
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(operation->wsabuf.buf), bytes),
+            keepalive});
+      }
+    }
+
+    // 回调未保留时释放本地引用，使同一块可立即被下一次读复用
+    keepalive.reset();
+
+    if (closing_ || !reading_) {
+      return ReadDelivery::consumed;
+    }
+    submit_one_read(operation);
+    return ReadDelivery::resubmitted;
+  }
+
+  // 补洞：按提交序号从环形槽里取出已到达的乱序完成并交付
+  void drain_reads() {
+    while (!closing_ && ring_pending_ != 0) {
       const std::size_t index = static_cast<std::size_t>(next_deliver_seq_ % read_slots_);
       ReadCompletion& entry = read_completions_[index];
       if (!entry.valid || entry.operation == nullptr ||
@@ -844,57 +826,13 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
 
       ReadCompletion completion = entry;
       entry = ReadCompletion{};
+      --ring_pending_;
       ++next_deliver_seq_;
 
-      auto* operation = completion.operation;
-      operation->completed_pending = false;
-      auto keepalive = std::move(operation->keepalive);
-
-      if (!reading_) {
-        if (completion.error == 0 && completion.eof) {
-          eof_ = true;
-        }
-        continue;
-      }
-
-      if (completion.error != 0) {
-        reading_ = false;
-        keepalive.reset();
-        deliver_read_error(from_socket_error(completion.error));
+      if (deliver_read(completion.operation, completion.bytes, completion.error, completion.eof) ==
+          ReadDelivery::stopped) {
         return;
       }
-
-      if (completion.eof) {
-        eof_ = true;
-        reading_ = false;
-        keepalive.reset();
-        deliver_read_error(make_error(ErrorCode::EndOfFile));
-        return;
-      }
-
-      auto callback = read_callback_;
-      if (!keepalive_reads_) {
-        auto span_callback = span_callback_;
-        if (span_callback) {
-          span_callback(std::span<const std::byte>(
-              reinterpret_cast<const std::byte*>(operation->wsabuf.buf),
-              completion.bytes));
-        }
-      } else if (callback) {
-        callback(ReadChunk{
-            std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(operation->wsabuf.buf),
-                completion.bytes),
-            keepalive});
-      }
-
-      // 回调未保留时释放本地引用，使同一块可立即被下一次读复用
-      keepalive.reset();
-
-      if (closing_ || !reading_) {
-        continue;
-      }
-      submit_one_read(operation);
     }
   }
 
@@ -1013,7 +951,7 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
       linger option{};
       option.l_onoff = 1;
       option.l_linger = 0;
-      (void)socket_setopt(socket_, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
+      (void)win_socket_setopt(socket_, SOL_SOCKET, SO_LINGER, &option, sizeof(option));
     }
 
     read_callback_ = nullptr;
@@ -1149,6 +1087,8 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
   std::vector<ReadCompletion> read_completions_;
   std::uint64_t next_submit_seq_ = 0;
   std::uint64_t next_deliver_seq_ = 0;
+  // 落环等待前序的乱序完成数量；为 0 时完全绕过环形槽
+  std::size_t ring_pending_ = 0;
 
   StreamConnectOp* connect_operation_ = nullptr;
   StreamWriteOp* current_write_ = nullptr;
@@ -1171,18 +1111,19 @@ void StreamConnectOp::on_complete(LoopImpl&, DWORD error) {
 }
 
 struct AcceptOp final : WinOperation {
-  std::shared_ptr<TcpListenerImpl> owner;
+  std::shared_ptr<IocpTcpListenerImpl> owner;
   SOCKET accept_socket = INVALID_SOCKET;
   char buffer[2 * kAcceptAddressLength]{};
 
   void on_complete(LoopImpl& loop, DWORD error) override;
 };
 
-class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImpl> {
+class IocpTcpListenerImpl final : public TcpListenerImpl,
+                                  public std::enable_shared_from_this<IocpTcpListenerImpl> {
  public:
-  explicit TcpListenerImpl(std::shared_ptr<LoopImpl> loop) : loop_(std::move(loop)) {}
+  explicit IocpTcpListenerImpl(std::shared_ptr<LoopImpl> loop) : loop_(std::move(loop)) {}
 
-  ~TcpListenerImpl() { destroy(); }
+  ~IocpTcpListenerImpl() { destroy(); }
 
   VoidResult bind(const SocketAddress& local, const BindOptions& options) {
     if (socket_ != INVALID_SOCKET) {
@@ -1209,7 +1150,7 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
       return std::unexpected(make_error(ErrorCode::Unknown));
     }
 
-    auto applied = apply_bind_options(socket, local.family(), options);
+    auto applied = win_apply_bind_options(socket, local.family(), options);
     if (!applied) {
       (void)::closesocket(socket);
       return applied;
@@ -1267,7 +1208,7 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
     if (socket_ == INVALID_SOCKET) {
       return std::unexpected(make_error(ErrorCode::BadFileDescriptor));
     }
-    return socket_local_address(socket_);
+    return win_socket_local_address(socket_);
   }
 
   [[nodiscard]] bool is_open() const noexcept { return socket_ != INVALID_SOCKET; }
@@ -1339,18 +1280,18 @@ class TcpListenerImpl final : public std::enable_shared_from_this<TcpListenerImp
       return;
     }
 
-    (void)socket_setopt(accepted,
+    (void)win_socket_setopt(accepted,
                        SOL_SOCKET,
                        SO_UPDATE_ACCEPT_CONTEXT,
                        reinterpret_cast<char*>(&socket_),
                        sizeof(socket_));
 
-    auto stream = std::make_shared<TcpStreamImpl>(loop_);
+    auto stream = std::make_shared<IocpTcpStreamImpl>(loop_);
     stream->adopt_socket(accepted, family);
 
     auto callback = accept_callback_;
     if (callback) {
-      callback(TcpStream(stream));
+      callback(adopt_stream(stream));
     }
 
     if (listening_ && !closing_) {
@@ -1491,6 +1432,28 @@ void AcceptOp::on_complete(LoopImpl&, DWORD error) {
   owner->handle_accept(this, error);
 }
 
+std::shared_ptr<TcpStreamImpl> create_iocp_stream_impl(std::shared_ptr<LoopImpl> loop) {
+  return std::make_shared<IocpTcpStreamImpl>(std::move(loop));
+}
+
+std::shared_ptr<TcpListenerImpl> create_iocp_listener_impl(std::shared_ptr<LoopImpl> loop) {
+  return std::make_shared<IocpTcpListenerImpl>(std::move(loop));
+}
+
+std::shared_ptr<TcpStreamImpl> create_tcp_stream_impl(std::shared_ptr<LoopImpl> loop) {
+  if (loop->backend() == Backend::Readiness) {
+    return create_ready_stream_impl(std::move(loop));
+  }
+  return create_iocp_stream_impl(std::move(loop));
+}
+
+std::shared_ptr<TcpListenerImpl> create_tcp_listener_impl(std::shared_ptr<LoopImpl> loop) {
+  if (loop->backend() == Backend::Readiness) {
+    return create_ready_listener_impl(std::move(loop));
+  }
+  return create_iocp_listener_impl(std::move(loop));
+}
+
 } // namespace detail
 
 TcpStream::TcpStream(Loop& loop) {
@@ -1498,7 +1461,7 @@ TcpStream::TcpStream(Loop& loop) {
   if (impl == nullptr) {
     throw std::runtime_error("uvnet: invalid loop");
   }
-  impl_ = std::make_shared<detail::TcpStreamImpl>(impl->shared_from_this());
+  impl_ = detail::create_tcp_stream_impl(impl->shared_from_this());
 }
 
 TcpStream::TcpStream(std::shared_ptr<detail::TcpStreamImpl> impl) : impl_(std::move(impl)) {}
@@ -1648,7 +1611,7 @@ TcpListener::TcpListener(Loop& loop) {
   if (impl == nullptr) {
     throw std::runtime_error("uvnet: invalid loop");
   }
-  impl_ = std::make_shared<detail::TcpListenerImpl>(impl->shared_from_this());
+  impl_ = detail::create_tcp_listener_impl(impl->shared_from_this());
 }
 
 TcpListener::~TcpListener() = default;

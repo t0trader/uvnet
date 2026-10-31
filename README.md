@@ -6,6 +6,9 @@
 
 - C++23 标准，`std::expected` 错误码风格 API
 - Linux：epoll（level-triggered）+ eventfd 唤醒；Windows：IOCP + `GetQueuedCompletionStatusEx` 批量（128 项）+ AcceptEx / ConnectEx
+- Windows 可选第二套后端：`Loop(Backend::Readiness)` 走 wepoll 就绪通知 +
+  非阻塞 `recv`/`send`、`recvfrom`/`sendto`，pingpong 延迟更低（见性能一节）；
+  默认仍是 IOCP，两套后端按 Loop 选择，不可在同一 Loop 内混用
 - IPv4 / IPv6，TCP 与 UDP
 - 异步 DNS：线程池 + `getaddrinfo` / `getnameinfo`，回调回到循环线程
 - TCP：bind / listen / accept / connect / read / write / shutdown / RST 关闭、
@@ -29,8 +32,9 @@
 - Windows UDP 发送 4 个并发 WSASendTo（而不是单槽串行），loopback pps +70%
 - Linux UDP `recvmmsg` / `sendmmsg` 批量收发（N=32），真实网卡 syscall 数降 32×
 - 读窗口可配置：`TcpStream::set_read_options`（`slots` / `chunk_size`）、
-  `UdpSocket::set_recv_options`（同名字段）；Windows 槽位数量生效，
-  Linux 仅 chunk_size 生效。必须在首次 `start_read` / `start_recv` 前设置
+  `UdpSocket::set_recv_options`（同名字段 + `batch`）；Windows 槽位数量仅 IOCP 后端生效，
+  `batch` 仅就绪式 UDP 生效；Linux 只认 chunk_size。必须在首次
+  `start_read` / `start_recv` 前设置
 
 ## 目录
 
@@ -196,6 +200,8 @@ stream->start_read([](Result<std::span<const std::byte>> chunk) {
   零拷贝模式按需取块；未启动读写时不分配
 - 关闭 TCP 连接时，排队中的写回调会收到 `ErrorCode::Canceled`；
   监听器关闭不会再次触发 accept 回调
+- 后端选择：`Loop()` 默认 IOCP（Linux 为 epoll）；`Loop(Backend::Readiness)` 在
+  Windows 上启用就绪式 TCP/UDP，延迟优先、吞吐低于 IOCP
 
 ## 性能
 
@@ -220,6 +226,30 @@ Windows / MD / Release，单次 1s 运行时长：
 + TCP_NODELAY  echo 16KB  396 MiB/s   pingpong p50 19.0 µs
 + AcceptEx x4  echo 64KB  468 MiB/s   (短连接 QPS +20-40%)
 ```
+
+### 就绪式后端（Windows，`uvnet_bench_tcp.exe readiness` / `uvnet_bench_udp.exe readiness`）
+
+wepoll 就绪通知 + 非阻塞收发，省掉 overlapped 提交与完成包往返：
+
+| TCP 场景 | 就绪式（Readiness） | IOCP（默认） |
+|---|---|---|
+| pingpong 64 B RTT p50 | **15–17 µs** | 17.7–18 µs |
+| pingpong avg / p99 | 18–20 / 48–54 µs | 20–21 / 47–60 µs |
+| echo 16 KB | ~190–215 MiB/s | ~300–400 MiB/s |
+| echo 64 KB | ~125–300 MiB/s | ~330–560 MiB/s |
+
+| UDP 场景 | 就绪式（Readiness） | IOCP（默认） |
+|---|---|---|
+| 64 B 吞吐 | ~78–84 kpps | ~73–79 kpps |
+| 1024 B 吞吐 | ~73–81 kpps | ~76–82 kpps |
+| pingpong 64 B RTT p50 | **17–19 µs** | 20.5–21.5 µs |
+| pingpong avg / p99 | 21–23 / 53–68 µs | 23–26 / 51–73 µs |
+
+就绪式 UDP 默认在一次可读事件里连续收到 `WSAEWOULDBLOCK` 为止（`UdpRecvOptions::batch`，
+默认 16）。每包一次 `epoll_wait` 会让吞吐减半（实测 1 万包 → 1 万次等待）；
+批量后等待次数约降到 1/batch，64 B 吞吐从 ~52 kpps 回到 ~80 kpps，pingpong 不变。
+
+低延迟场景选 Readiness，吞吐优先选默认 IOCP。
 
 ### UDP（Windows loopback，默认 4 槽收 + 4 并发发）
 

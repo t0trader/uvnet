@@ -30,7 +30,7 @@ struct KeepAliveOptions {
 
 // 读窗口配置（必须在首次 start_read 之前设置）
 struct ReadOptions {
-  // Windows 多 outstanding 读槽数量；Linux 忽略该字段
+  // Windows IOCP 后端的多 outstanding 读槽数量；Linux 与就绪式后端忽略该字段
   std::size_t slots = 4;
   // 单次读缓冲大小
   std::size_t chunk_size = 64 * 1024;

@@ -79,7 +79,10 @@ void TimerImpl::release_ref() {
   loop_->end_work();
 }
 
-LoopImpl::LoopImpl() : thread_id_(std::this_thread::get_id()), now_ms_(steady_now_ms()) {}
+LoopImpl::LoopImpl(Backend backend)
+    : requested_backend_(backend),
+      thread_id_(std::this_thread::get_id()),
+      now_ms_(steady_now_ms()) {}
 
 LoopImpl::~LoopImpl() {
   if (poller_) {
@@ -87,8 +90,8 @@ LoopImpl::~LoopImpl() {
   }
 }
 
-std::shared_ptr<LoopImpl> LoopImpl::create() {
-  auto loop = std::shared_ptr<LoopImpl>(new LoopImpl());
+std::shared_ptr<LoopImpl> LoopImpl::create(Backend backend) {
+  auto loop = std::shared_ptr<LoopImpl>(new LoopImpl(backend));
   if (!loop->init()) {
     return nullptr;
   }
@@ -96,7 +99,7 @@ std::shared_ptr<LoopImpl> LoopImpl::create() {
 }
 
 bool LoopImpl::init() {
-  poller_ = create_poller();
+  poller_ = create_poller(requested_backend_);
   if (!poller_) {
     return false;
   }
@@ -354,8 +357,10 @@ bool LoopImpl::run_once(std::chrono::milliseconds max_wait, bool no_wait) {
 
 namespace uvnet {
 
-Loop::Loop() {
-  impl_ = detail::LoopImpl::create();
+Loop::Loop() : Loop(Backend::Unknown) {}
+
+Loop::Loop(Backend backend) {
+  impl_ = detail::LoopImpl::create(backend);
   if (!impl_) {
     throw std::runtime_error("uvnet: failed to initialize event loop");
   }

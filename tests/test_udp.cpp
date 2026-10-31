@@ -9,9 +9,10 @@ using namespace uvnet;
 
 constexpr int kDatagramCount = 32;
 
-void test_echo(Family family) {
-  Loop loop;
+void test_echo(Backend backend, Family family) {
+  Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(10));
+  CHECK(loop.backend() == backend);
 
   UdpSocket server(loop, family);
   const auto server_bound = server.bind(SocketAddress::loopback(family, 0));
@@ -100,8 +101,8 @@ void test_echo(Family family) {
   CHECK(received == kDatagramCount);
 }
 
-void test_connected_send(Family family) {
-  Loop loop;
+void test_connected_send(Backend backend, Family family) {
+  Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(5));
 
   UdpSocket server(loop, family);
@@ -154,11 +155,100 @@ void test_connected_send(Family family) {
   CHECK(client_got);
 }
 
+// 突发多包：验证一次可读事件里连续收多个 datagram 时不丢包、不串内容
+void test_burst(Backend backend) {
+  Loop loop(backend);
+  uvtest::Guard guard(loop, std::chrono::seconds(5));
+  constexpr int kCount = 16;
+
+  UdpSocket server(loop);
+  CHECK_OK(server.bind(SocketAddress::loopback(Family::IPv4, 0)));
+  const auto address = server.local_address();
+  if (!address) {
+    CHECK(false);
+    return;
+  }
+
+  UdpSocket client(loop);
+  CHECK_OK(client.bind(SocketAddress::loopback(Family::IPv4, 0)));
+  CHECK_OK(client.connect(*address));
+
+  int server_received = 0;
+  std::vector<int> tags;
+
+  CHECK_OK(server.start_recv([&](Result<DatagramView> datagram) {
+    if (!datagram) {
+      CHECK(false);
+      guard.cancel();
+      return;
+    }
+    ++server_received;
+    if (server_received <= kCount) {
+      if (!server.send_to(datagram->source, datagram->data)) {
+        CHECK(false);
+      }
+    }
+  }));
+
+  CHECK_OK(client.start_recv([&](Result<DatagramView> datagram) {
+    if (!datagram) {
+      CHECK(false);
+      guard.cancel();
+      return;
+    }
+    CHECK(datagram->data.size() == 1);
+    if (datagram->data.size() != 1) {
+      return;
+    }
+    tags.push_back(static_cast<int>(datagram->data[0]));
+    if (static_cast<int>(tags.size()) >= kCount) {
+      client.stop_recv();
+      server.stop_recv();
+      client.close();
+      server.close();
+      guard.cancel();
+    }
+  }));
+
+  for (int i = 0; i < kCount; ++i) {
+    const std::vector<std::byte> payload{static_cast<std::byte>(i)};
+    if (!client.send(payload)) {
+      CHECK(false);
+      guard.cancel();
+      break;
+    }
+  }
+
+  loop.run();
+
+  CHECK(server_received == kCount);
+  CHECK(static_cast<int>(tags.size()) == kCount);
+
+  // UDP 不保证顺序，这里只校验每个标签恰好出现一次
+  std::vector<int> seen(kCount, 0);
+  for (int tag : tags) {
+    if (tag >= 0 && tag < kCount) {
+      ++seen[tag];
+    }
+  }
+  for (int i = 0; i < kCount; ++i) {
+    CHECK(seen[i] == 1);
+  }
+}
+
 } // namespace
 
 int main() {
-  test_echo(Family::IPv4);
-  test_echo(Family::IPv6);
-  test_connected_send(Family::IPv4);
+#if defined(_WIN32)
+  const Backend backends[] = {Backend::Iocp, Backend::Readiness};
+#else
+  const Backend backends[] = {Backend::Epoll};
+#endif
+  for (const Backend backend : backends) {
+    test_echo(backend, Family::IPv4);
+    test_echo(backend, Family::IPv6);
+    test_connected_send(backend, Family::IPv4);
+    test_burst(backend);
+  }
   return uvtest::finish("udp");
 }

@@ -135,7 +135,8 @@ void EpollPoller::poll(std::optional<std::chrono::milliseconds> timeout) {
   }
 }
 
-std::unique_ptr<Poller> create_poller() {
+std::unique_ptr<Poller> create_poller(Backend /*backend*/) {
+  // Linux 只有 epoll 一种后端，忽略请求值
   return std::make_unique<EpollPoller>();
 }
 

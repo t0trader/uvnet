@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <span>
@@ -10,6 +11,22 @@
 namespace {
 
 using namespace uvnet;
+
+// 默认后端；命令行传 readiness / iocp / epoll 可指定
+Backend g_backend = Backend::Unknown;
+
+const char* backend_name(Backend backend) {
+  switch (backend) {
+    case Backend::Iocp:
+      return "iocp";
+    case Backend::Readiness:
+      return "readiness";
+    case Backend::Epoll:
+      return "epoll";
+    default:
+      return "default";
+  }
+}
 
 std::vector<std::byte> make_payload(std::size_t size) {
   std::vector<std::byte> payload(size);
@@ -29,7 +46,7 @@ SocketAddress bind_loopback(TcpListener& listener) {
 }
 
 void run_throughput(std::size_t chunk_size, std::size_t total_bytes) {
-  Loop loop;
+  Loop loop(g_backend);
   bench::Guard guard(loop, std::chrono::seconds(60));
 
   bool failed = false;
@@ -154,7 +171,7 @@ void run_throughput(std::size_t chunk_size, std::size_t total_bytes) {
 }
 
 void run_pingpong(std::size_t iterations, std::size_t message_size) {
-  Loop loop;
+  Loop loop(g_backend);
   bench::Guard guard(loop, std::chrono::seconds(60));
 
   bool failed = false;
@@ -274,7 +291,7 @@ void run_pingpong(std::size_t iterations, std::size_t message_size) {
 }
 
 void run_send_throughput(std::size_t chunk_size, std::size_t total_bytes, bool zero_copy) {
-  Loop loop;
+  Loop loop(g_backend);
   bench::Guard guard(loop, std::chrono::seconds(60));
 
   bool failed = false;
@@ -409,8 +426,18 @@ void run_send_throughput(std::size_t chunk_size, std::size_t total_bytes, bool z
 
 } // namespace
 
-int main() {
-  std::printf("== TCP ==\n");
+int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "readiness") == 0) {
+      g_backend = Backend::Readiness;
+    } else if (std::strcmp(argv[i], "iocp") == 0) {
+      g_backend = Backend::Iocp;
+    } else if (std::strcmp(argv[i], "epoll") == 0) {
+      g_backend = Backend::Epoll;
+    }
+  }
+
+  std::printf("== TCP (%s) ==\n", backend_name(g_backend));
   run_throughput(16 * 1024, 32u * 1024u * 1024u);
   run_throughput(64 * 1024, 32u * 1024u * 1024u);
   run_pingpong(20000, 64);

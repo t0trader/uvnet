@@ -61,11 +61,11 @@ class Poller {
   [[nodiscard]] virtual Backend backend() const = 0;
 };
 
-std::unique_ptr<Poller> create_poller();
+std::unique_ptr<Poller> create_poller(Backend backend);
 
 class LoopImpl : public std::enable_shared_from_this<LoopImpl> {
  public:
-  static std::shared_ptr<LoopImpl> create();
+  static std::shared_ptr<LoopImpl> create(Backend backend = Backend::Unknown);
 
   ~LoopImpl();
   LoopImpl(const LoopImpl&) = delete;
@@ -96,7 +96,7 @@ class LoopImpl : public std::enable_shared_from_this<LoopImpl> {
   void remove_timer(TimerImpl* timer);
 
  private:
-  LoopImpl();
+  explicit LoopImpl(Backend backend);
   bool init();
 
   void flush_pending();
@@ -105,6 +105,7 @@ class LoopImpl : public std::enable_shared_from_this<LoopImpl> {
       std::optional<std::chrono::milliseconds> max_wait) const;
 
   std::unique_ptr<Poller> poller_;
+  Backend requested_backend_ = Backend::Unknown;
   std::deque<std::function<void()>> pending_;
   mutable std::mutex pending_mutex_;
   bool wake_pending_ = false;

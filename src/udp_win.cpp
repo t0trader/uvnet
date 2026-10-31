@@ -10,6 +10,8 @@
 #include "detail/buffer_pool.hpp"
 #include "detail/platform.hpp"
 #include "detail/poller_win.hpp"
+#include "detail/udp_impl_win.hpp"
+#include "detail/win_socket.hpp"
 
 namespace uvnet {
 namespace {
@@ -47,14 +49,14 @@ bool bind_any_udp(SOCKET socket, Family family) {
 
 namespace detail {
 
-class UdpSocketImpl;
+class IocpUdpSocketImpl;
 
 // Windows 单 socket 只有一个待完成收包时 pps 很低；
 // 这里维护多个常驻收包槽位，完成一个立即补投一个。
 inline constexpr std::size_t kDefaultRecvSlots = 4;
 
 struct UdpRecvOp final : WinOperation {
-  std::shared_ptr<UdpSocketImpl> owner;
+  std::shared_ptr<IocpUdpSocketImpl> owner;
   WSABUF wsabuf{};
   std::shared_ptr<const void> keepalive;
   sockaddr_storage source{};
@@ -66,7 +68,7 @@ struct UdpRecvOp final : WinOperation {
 };
 
 struct UdpSendOp final : WinOperation {
-  std::shared_ptr<UdpSocketImpl> owner;
+  std::shared_ptr<IocpUdpSocketImpl> owner;
   std::vector<std::byte> owned;
   const std::byte* external = nullptr;
   std::size_t external_size = 0;
@@ -80,12 +82,13 @@ struct UdpSendOp final : WinOperation {
   void on_complete(LoopImpl& loop, DWORD error) override;
 };
 
-class UdpSocketImpl final : public std::enable_shared_from_this<UdpSocketImpl> {
+class IocpUdpSocketImpl final : public UdpSocketImpl,
+                                 public std::enable_shared_from_this<IocpUdpSocketImpl> {
  public:
-  UdpSocketImpl(std::shared_ptr<LoopImpl> loop, Family family, UdpOptions options)
+  IocpUdpSocketImpl(std::shared_ptr<LoopImpl> loop, Family family, UdpOptions options)
       : loop_(std::move(loop)), family_(family), options_(options) {}
 
-  ~UdpSocketImpl() { destroy(); }
+  ~IocpUdpSocketImpl() { destroy(); }
 
   VoidResult bind(const SocketAddress& local) {
     if (local.family() != family_) {
@@ -402,7 +405,7 @@ class UdpSocketImpl final : public std::enable_shared_from_this<UdpSocketImpl> {
     }
 
     in_addr address{};
-    std::memcpy(&address, iface.bytes_.data(), 4);
+    std::memcpy(&address, address_bytes(iface).data(), 4);
     if (socket_setopt(socket_, IPPROTO_IP, IP_MULTICAST_IF, &address, sizeof(address)) != 0) {
       return std::unexpected(from_socket_error(WSAGetLastError()));
     }
@@ -422,7 +425,7 @@ class UdpSocketImpl final : public std::enable_shared_from_this<UdpSocketImpl> {
 
     if (family_ == Family::IPv6) {
       ipv6_mreq request{};
-      std::memcpy(&request.ipv6mr_multiaddr, group.bytes_.data(), 16);
+      std::memcpy(&request.ipv6mr_multiaddr, address_bytes(group).data(), 16);
       request.ipv6mr_interface = iface.scope_id();
       const int option = join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP;
       if (socket_setopt(socket_, IPPROTO_IPV6, option, &request, sizeof(request)) != 0) {
@@ -432,9 +435,9 @@ class UdpSocketImpl final : public std::enable_shared_from_this<UdpSocketImpl> {
     }
 
     ip_mreq request{};
-    std::memcpy(&request.imr_multiaddr, group.bytes_.data(), 4);
+    std::memcpy(&request.imr_multiaddr, address_bytes(group).data(), 4);
     if (iface.family() == Family::IPv4) {
-      std::memcpy(&request.imr_interface, iface.bytes_.data(), 4);
+      std::memcpy(&request.imr_interface, address_bytes(iface).data(), 4);
     } else {
       request.imr_interface.s_addr = htonl(INADDR_ANY);
     }
@@ -969,6 +972,21 @@ void UdpSendOp::on_complete(LoopImpl&, DWORD error) {
   owner->handle_send(this, error);
 }
 
+std::shared_ptr<UdpSocketImpl> create_iocp_udp_socket_impl(std::shared_ptr<LoopImpl> loop,
+                                                          Family family,
+                                                          const UdpOptions& options) {
+  return std::make_shared<IocpUdpSocketImpl>(std::move(loop), family, options);
+}
+
+std::shared_ptr<UdpSocketImpl> create_udp_socket_impl(std::shared_ptr<LoopImpl> loop,
+                                                      Family family,
+                                                      const UdpOptions& options) {
+  if (loop->backend() == Backend::Readiness) {
+    return create_ready_udp_socket_impl(std::move(loop), family, options);
+  }
+  return create_iocp_udp_socket_impl(std::move(loop), family, options);
+}
+
 } // namespace detail
 
 UdpSocket::UdpSocket(Loop& loop, Family family, const UdpOptions& options) {
@@ -976,7 +994,7 @@ UdpSocket::UdpSocket(Loop& loop, Family family, const UdpOptions& options) {
   if (impl == nullptr) {
     throw std::runtime_error("uvnet: invalid loop");
   }
-  impl_ = std::make_shared<detail::UdpSocketImpl>(impl->shared_from_this(), family, options);
+  impl_ = detail::create_udp_socket_impl(impl->shared_from_this(), family, options);
 }
 
 UdpSocket::~UdpSocket() = default;

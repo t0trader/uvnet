@@ -1,5 +1,6 @@
 #include <memory>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "test_support.hpp"
@@ -20,9 +21,10 @@ std::vector<std::byte> make_payload() {
   return payload;
 }
 
-void test_echo(Family family) {
-  Loop loop;
+void test_echo(Backend backend, Family family) {
+  Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(10));
+  CHECK(loop.backend() == backend);
 
   TcpListener listener(loop);
   const auto bound = listener.bind(SocketAddress::loopback(family, 0));
@@ -154,8 +156,8 @@ void test_echo(Family family) {
   CHECK(client_received == kTotalSize);
 }
 
-void test_connection_refused() {
-  Loop loop;
+void test_connection_refused(Backend backend) {
+  Loop loop(backend);
   uvtest::Guard guard(loop, std::chrono::seconds(5));
 
   TcpListener listener(loop);
@@ -189,11 +191,130 @@ void test_connection_refused() {
   CHECK(got_result);
 }
 
+// 视图读（无 keepalive）+ 拷贝写路径，覆盖 SpanReadCallback
+void test_span_echo(Backend backend) {
+  Loop loop(backend);
+  uvtest::Guard guard(loop, std::chrono::seconds(10));
+  CHECK(loop.backend() == backend);
+
+  TcpListener listener(loop);
+  CHECK_OK(listener.bind(SocketAddress::loopback(Family::IPv4, 0)));
+  const auto address = listener.local_address();
+  if (!address) {
+    CHECK(false);
+    return;
+  }
+
+  const auto payload = make_payload();
+  std::size_t server_received = 0;
+  std::size_t client_received = 0;
+
+  CHECK_OK(listener.listen(16, [&](Result<TcpStream> accepted) {
+    if (!accepted) {
+      CHECK(false);
+      guard.cancel();
+      return;
+    }
+    auto server = std::make_shared<TcpStream>(std::move(*accepted));
+    CHECK_OK(server->start_read(
+        [server, &server_received](Result<std::span<const std::byte>> chunk) {
+          if (!chunk) {
+            server->close();
+            return;
+          }
+          server_received += chunk->size();
+          if (!server->write(*chunk)) {
+            CHECK(false);
+          }
+        }));
+  }));
+
+  TcpStream client(loop);
+  const auto connected = client.connect(*address, [&](VoidResult result) {
+    if (!result) {
+      CHECK(false);
+      guard.cancel();
+      return;
+    }
+
+    CHECK_OK(client.start_read([&](Result<std::span<const std::byte>> chunk) {
+      if (!chunk) {
+        CHECK(false);
+        client.close();
+        guard.cancel();
+        return;
+      }
+      client_received += chunk->size();
+      if (client_received >= kTotalSize) {
+        client.stop_read();
+        CHECK_OK(client.shutdown([&](VoidResult shutdown_result) {
+          CHECK(shutdown_result.has_value());
+          client.close();
+          listener.close();
+          guard.cancel();
+        }));
+      }
+    }));
+
+    for (std::size_t i = 0; i < kChunkCount; ++i) {
+      std::span<const std::byte> chunk(payload.data() + i * kChunkSize, kChunkSize);
+      if (!client.write(chunk)) {
+        CHECK(false);
+        guard.cancel();
+        return;
+      }
+    }
+  });
+
+  if (!connected) {
+    CHECK(false);
+    guard.cancel();
+  }
+
+  loop.run();
+
+  CHECK(server_received == kTotalSize);
+  CHECK(client_received == kTotalSize);
+}
+
+#if defined(_WIN32)
+// 就绪式 Loop 没有 IOCP，跨线程 post 依赖唤醒对；验证能唤醒阻塞中的 epoll_wait
+void test_readiness_cross_thread_post() {
+  Loop loop(Backend::Readiness);
+  // 没有活动句柄时 run() 会立即返回，用保护定时器把循环挂住
+  uvtest::Guard guard(loop, std::chrono::seconds(5));
+  bool ran = false;
+
+  std::thread worker([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    loop.post([&] {
+      ran = true;
+      loop.stop();
+    });
+  });
+
+  loop.run();
+  worker.join();
+  CHECK(ran);
+}
+#endif
+
 } // namespace
 
 int main() {
-  test_echo(Family::IPv4);
-  test_echo(Family::IPv6);
-  test_connection_refused();
+#if defined(_WIN32)
+  const Backend backends[] = {Backend::Iocp, Backend::Readiness};
+#else
+  const Backend backends[] = {Backend::Epoll};
+#endif
+  for (const Backend backend : backends) {
+    test_echo(backend, Family::IPv4);
+    test_echo(backend, Family::IPv6);
+    test_connection_refused(backend);
+    test_span_echo(backend);
+  }
+#if defined(_WIN32)
+  test_readiness_cross_thread_post();
+#endif
   return uvtest::finish("tcp");
 }

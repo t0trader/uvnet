@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <span>
 #include <vector>
@@ -10,6 +11,22 @@ namespace {
 
 using namespace uvnet;
 
+// 默认后端；命令行传 readiness / iocp / epoll 可指定
+Backend g_backend = Backend::Unknown;
+
+const char* backend_name(Backend backend) {
+  switch (backend) {
+    case Backend::Iocp:
+      return "iocp";
+    case Backend::Readiness:
+      return "readiness";
+    case Backend::Epoll:
+      return "epoll";
+    default:
+      return "default";
+  }
+}
+
 std::vector<std::byte> make_payload(std::size_t size) {
   std::vector<std::byte> payload(size);
   for (std::size_t i = 0; i < size; ++i) {
@@ -19,12 +36,13 @@ std::vector<std::byte> make_payload(std::size_t size) {
 }
 
 void run_throughput(std::size_t datagram_size, std::size_t count) {
-  Loop loop;
+  Loop loop(g_backend);
   bench::Guard guard(loop, std::chrono::seconds(60));
 
   bool failed = false;
   bool completed = false;
   bool tail_armed = false;
+  bool pumping = false;
   std::size_t sent = 0;
   std::size_t in_flight = 0;
   std::size_t received = 0;
@@ -48,8 +66,9 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
   }
 
   UdpSocket client(loop, Family::IPv4);
-  if (!client.bind(SocketAddress::loopback(Family::IPv4, 0))) {
-    std::printf("udp throughput %zu B: client bind 失败\n", datagram_size);
+  if (!client.bind(SocketAddress::loopback(Family::IPv4, 0)) ||
+      !client.connect(*address)) {
+    std::printf("udp throughput %zu B: client 初始化失败\n", datagram_size);
     return;
   }
 
@@ -64,6 +83,8 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
       guard.cancel();
     }
   });
+
+  std::function<void()> pump;
 
   (void)client.start_recv([&](Result<DatagramView> datagram) {
     if (!datagram) {
@@ -88,7 +109,9 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
       client.close();
       server.close();
       guard.cancel();
+      return;
     }
+    pump();
   });
 
   const auto finalize = [&] {
@@ -104,13 +127,18 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
     guard.cancel();
   };
 
-  std::function<void()> pump;
   pump = [&] {
-    while (!failed && !completed && in_flight < 64 && sent < count) {
+    if (pumping) {
+      return;
+    }
+    pumping = true;
+    // 发送完成即时回（就绪式）时 in_flight 始终为 0，用"已发未回"再兜一层流控
+    while (!failed && !completed && in_flight < 64 && sent < count &&
+           sent - received < 64) {
       ++sent;
       ++in_flight;
-      const bool queued = bool(client.send_to(
-          *address, payload, [&](VoidResult result) {
+      const bool queued = bool(client.send(
+          payload, [&](VoidResult result) {
             if (!result) {
               if (!completed) {
                 failed = true;
@@ -134,6 +162,7 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
         break;
       }
     }
+    pumping = false;
   };
 
   start_ns = bench::now_ns();
@@ -162,7 +191,7 @@ void run_throughput(std::size_t datagram_size, std::size_t count) {
 }
 
 void run_pingpong(std::size_t iterations, std::size_t datagram_size) {
-  Loop loop;
+  Loop loop(g_backend);
   bench::Guard guard(loop, std::chrono::seconds(60));
 
   bool failed = false;
@@ -186,8 +215,9 @@ void run_pingpong(std::size_t iterations, std::size_t datagram_size) {
   }
 
   UdpSocket client(loop, Family::IPv4);
-  if (!client.bind(SocketAddress::loopback(Family::IPv4, 0))) {
-    std::printf("udp pingpong: client bind 失败\n");
+  if (!client.bind(SocketAddress::loopback(Family::IPv4, 0)) ||
+      !client.connect(*address)) {
+    std::printf("udp pingpong: client 初始化失败\n");
     return;
   }
 
@@ -234,7 +264,7 @@ void run_pingpong(std::size_t iterations, std::size_t datagram_size) {
 
   send_next = [&] {
     send_ns = bench::now_ns();
-    if (!client.send_to(*address, payload, [&](VoidResult result) {
+    if (!client.send(payload, [&](VoidResult result) {
           if (!result && !completed) {
             failed = true;
             guard.cancel();
@@ -260,8 +290,18 @@ void run_pingpong(std::size_t iterations, std::size_t datagram_size) {
 
 } // namespace
 
-int main() {
-  std::printf("== UDP ==\n");
+int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "readiness") == 0) {
+      g_backend = Backend::Readiness;
+    } else if (std::strcmp(argv[i], "iocp") == 0) {
+      g_backend = Backend::Iocp;
+    } else if (std::strcmp(argv[i], "epoll") == 0) {
+      g_backend = Backend::Epoll;
+    }
+  }
+
+  std::printf("== UDP (%s) ==\n", backend_name(g_backend));
   run_throughput(64, 10000);
   run_throughput(1024, 10000);
   run_pingpong(5000, 64);

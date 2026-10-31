@@ -23,9 +23,12 @@ struct UdpOptions {
 
 // UDP 收包窗口配置（必须在首次 start_recv 之前设置）
 struct UdpRecvOptions {
-  // Windows 多 outstanding 收包槽数量；Linux 忽略该字段
+  // Windows IOCP 后端的多 outstanding 收包槽数量；Linux 与就绪式后端忽略该字段
   std::size_t slots = 4;
   std::size_t chunk_size = 64 * 1024;
+  // Windows 就绪式后端单次可读事件最多收多少个 datagram（1 表示不批量）；
+  // IOCP 与 Linux 忽略该字段。批量能显著减少每个包的 epoll_wait 次数
+  std::size_t batch = 16;
 };
 
 struct Datagram {

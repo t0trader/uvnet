@@ -15,11 +15,20 @@ add_library(uvnet STATIC
 )
 
 if(WIN32)
+  enable_language(C)
   target_sources(uvnet PRIVATE
     src/loop_win.cpp
+    src/poller_win_ready.cpp
     src/tcp_win.cpp
+    src/tcp_win_ready.cpp
     src/udp_win.cpp
+    src/udp_win_ready.cpp
+    src/detail/wepoll/wepoll.c
   )
+  # 第三方 wepoll 源码不在本项目的警告策略内
+  if(MSVC)
+    set_source_files_properties(src/detail/wepoll/wepoll.c PROPERTIES COMPILE_OPTIONS "/w")
+  endif()
   target_compile_definitions(uvnet PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
