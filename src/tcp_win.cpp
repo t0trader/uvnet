@@ -954,10 +954,22 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
         finish_close_if_ready();
       }
     } else {
-      // 同步成功时 FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 不会投递完成包
-      // 通过 post 走完成路径，避免递归 submit→drain→submit 爆栈
+      // 同步成功时 FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 不会再投递完成包。
+      // 直接走完成路径可省掉一次 post + 一轮 loop 迭代（pingpong 延迟主要来自这里）；
+      // 但只允许一层直调：写回调里再 write 时，第二次同步完成改为 post，
+      // 避免 write -> 回调 -> write 的递归爆栈。
       operation->ov.InternalHigh = bytes;
       operation->completed_synchronically = true;
+
+      if (sync_write_depth_ == 0) {
+        // 直调期间会释放 operation->owner，这里自己再持一次，防止实现对象被回收
+        auto keepalive = shared_from_this();
+        ++sync_write_depth_;
+        handle_write(operation, 0);
+        --sync_write_depth_;
+        return;
+      }
+
       auto loop = loop_;
       loop_->post([operation, loop] { operation->on_complete(*loop, 0); });
     }
@@ -1142,6 +1154,8 @@ class TcpStreamImpl final : public std::enable_shared_from_this<TcpStreamImpl> {
   StreamWriteOp* current_write_ = nullptr;
   std::deque<StreamWriteOp*> writes_;
   std::vector<StreamWriteOp*> free_writes_;
+  // 同步写完成时允许直调回调的深度：只放一层，更深走 post，避免递归爆栈
+  int sync_write_depth_ = 0;
 };
 
 void StreamReadOp::on_complete(LoopImpl&, DWORD error) {

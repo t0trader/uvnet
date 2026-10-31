@@ -82,7 +82,10 @@ class TcpStream {
   VoidResult start_read(SpanReadCallback cb);
   void stop_read();
 
-  // 数据会被复制进内部缓冲区，调用返回后即可释放
+  // 数据会被复制进内部缓冲区，调用返回后即可释放。
+  // 注意：若内核能立即把数据全部收下（Windows 上是 FILE_SKIP 同步完成路径），
+  // 完成回调会在本调用栈内触发；回调里再次 write 时第二次完成会转回异步，
+  // 因此不会无限递归。
   VoidResult write(std::span<const std::byte> data, WriteCallback cb = {});
   // 零拷贝写：buffer.data 指向的存储需在完成回调返回前保持有效
   VoidResult write(WriteBuffer buffer, WriteCallback cb = {});
